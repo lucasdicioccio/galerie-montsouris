@@ -1,0 +1,1321 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use crate::actions::{
+    execute_action, run_script_thread, ActionContext, AppState, ScriptResult,
+};
+use crate::config::{Config, KeyBindingMap, ModifierSet};
+use crate::curve_editor::CurveEditor;
+use crate::filters::{Filter, RotateFill};
+use crate::gallery::{BackgroundColor, EditGallery, PhotoCollection};
+use crate::image_cache::{ImageCache, ImageHistogram, LoadState};
+use crate::overlay::{fit_rect, OverlayState};
+use crate::viewer::ViewerState;
+
+pub struct GalerieApp {
+    config: Config,
+    keybindings: KeyBindingMap,
+    collection: PhotoCollection,
+    viewer: ViewerState,
+    cache: ImageCache,
+    overlay: OverlayState,
+    app_state: AppState,
+    script_tx: crossbeam_channel::Sender<crate::actions::ScriptRequest>,
+    script_result_tx: crossbeam_channel::Sender<ScriptResult>,
+    script_result_rx: crossbeam_channel::Receiver<ScriptResult>,
+    // Gallery editing
+    edit_galleries: Vec<EditGallery>,
+    gallery_selector_open: bool,
+    gallery_selector_cursor: usize,
+    // Tiling cell size (logical px) from the last rendered frame, used to size thumbnails.
+    last_tiling_cell_size: f32,
+    /// Saved tiling `cols` so switching back from single mode restores the previous grid size.
+    last_tiling_cols: usize,
+    /// Which per-photo filter rows are expanded, keyed by position index.
+    filter_accordion_open: HashSet<usize>,
+    /// Same for the gallery pre-filter stack.
+    gallery_pre_accordion_open: HashSet<usize>,
+    /// Same for the gallery post-filter stack.
+    gallery_post_accordion_open: HashSet<usize>,
+}
+
+impl GalerieApp {
+    pub fn new(
+        _cc: &eframe::CreationContext,
+        config: Config,
+        collection: PhotoCollection,
+        edit_galleries: Vec<EditGallery>,
+    ) -> Self {
+        let keybindings = config.build_keybinding_map().unwrap_or_else(|e| {
+            log::error!("keybinding config error: {e}");
+            Default::default()
+        });
+
+        let cache = ImageCache::new(config.general.cache_size);
+        let viewer = ViewerState::new_tiling(config.general.tile_count);
+
+        let (script_tx, script_rx) = crossbeam_channel::bounded(4);
+        let (script_result_tx, script_result_rx) = crossbeam_channel::unbounded();
+
+        std::thread::spawn(move || run_script_thread(script_rx));
+
+        let mut app_state = AppState::default();
+        app_state.background_color = collection
+            .galerie_background()
+            .unwrap_or(config.general.background_color);
+
+        let initial_cols = {
+            let cols = (config.general.tile_count as f64).sqrt().ceil() as usize;
+            cols.max(1)
+        };
+        Self {
+            config,
+            keybindings,
+            collection,
+            viewer,
+            cache,
+            overlay: OverlayState::default(),
+            app_state,
+            script_tx,
+            script_result_tx,
+            script_result_rx,
+            edit_galleries,
+            gallery_selector_open: false,
+            gallery_selector_cursor: 0,
+            last_tiling_cell_size: 200.0,
+            last_tiling_cols: initial_cols,
+            filter_accordion_open: HashSet::new(),
+            gallery_pre_accordion_open: HashSet::new(),
+            gallery_post_accordion_open: HashSet::new(),
+        }
+    }
+
+    fn handle_input(&mut self, ctx: &egui::Context) {
+        // Keep last_tiling_cols in sync so switching back from single restores the grid size.
+        if let ViewerState::Tiling(s) = &self.viewer {
+            self.last_tiling_cols = s.cols;
+        }
+
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    // ── Gallery selector: intercepts all keys while open ──────────
+                    if self.gallery_selector_open {
+                        let n = self.edit_galleries.len();
+                        match key {
+                            egui::Key::ArrowUp | egui::Key::K => {
+                                if self.gallery_selector_cursor > 0 {
+                                    self.gallery_selector_cursor -= 1;
+                                }
+                            }
+                            egui::Key::ArrowDown | egui::Key::J => {
+                                if self.gallery_selector_cursor + 1 < n {
+                                    self.gallery_selector_cursor += 1;
+                                }
+                            }
+                            egui::Key::Space | egui::Key::Enter => {
+                                self.toggle_at_cursor();
+                            }
+                            egui::Key::T | egui::Key::Escape => {
+                                self.gallery_selector_open = false;
+                            }
+                            _ => {}
+                        }
+                        continue; // do not propagate to keybindings
+                    }
+
+                    // ── T intercept when edit-galleries are present ───────────────
+                    if *key == egui::Key::T
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !self.edit_galleries.is_empty()
+                    {
+                        self.handle_gallery_t_press();
+                        continue;
+                    }
+
+                    // ── Escape exits fullscreen before doing anything else ────────
+                    if *key == egui::Key::Escape && self.app_state.is_fullscreen {
+                        self.app_state.is_fullscreen = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        continue;
+                    }
+
+                    // ── Normal keybinding dispatch ────────────────────────────────
+                    let mods = ModifierSet {
+                        ctrl: modifiers.ctrl,
+                        // Plus (Shift+= on most keyboards) inherently carries shift;
+                        // strip it so a binding with modifiers=[] fires naturally.
+                        shift: modifiers.shift && *key != egui::Key::Plus,
+                        alt: modifiers.alt,
+                    };
+                    let action = self.keybindings.iter().find_map(|(combo, action)| {
+                        if combo.key == *key && combo.modifiers == mods {
+                            Some(action.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(action) = action {
+                        if matches!(action, crate::actions::Action::CycleBackground) {
+                            self.handle_cycle_background();
+                        } else {
+                            let tile_count = self.last_tiling_cols * self.last_tiling_cols;
+                            let mut cx = ActionContext {
+                                collection: &mut self.collection,
+                                viewer: &mut self.viewer,
+                                cache: &mut self.cache,
+                                overlay: &mut self.overlay,
+                                app_state: &mut self.app_state,
+                                tile_count,
+                                script_tx: &self.script_tx,
+                                script_result_tx: self.script_result_tx.clone(),
+                                ctx: ctx.clone(),
+                            };
+                            execute_action(&action, &mut cx);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn handle_cycle_background(&mut self) {
+        self.app_state.background_color = self.app_state.background_color.cycle();
+        let color = self.app_state.background_color;
+
+        let paths = self.collection.galerie_file_paths();
+        if paths.len() == 1 {
+            if let Err(e) = self.collection.set_galerie_background(&paths[0], color) {
+                self.overlay.push_toast(format!("Background save error: {e}"));
+                return;
+            }
+            for eg in &mut self.edit_galleries {
+                if eg.path.canonicalize().ok().as_deref() == Some(&paths[0]) {
+                    eg.background_color = Some(color);
+                }
+            }
+        }
+
+        self.overlay.push_toast(format!("Background: {}", color.label()));
+    }
+
+    fn bg_color(&self) -> egui::Color32 {
+        match self.app_state.background_color {
+            BackgroundColor::Black => egui::Color32::from_gray(15),
+            BackgroundColor::Gray  => egui::Color32::from_gray(128),
+            BackgroundColor::White => egui::Color32::from_gray(245),
+        }
+    }
+
+    // ── Gallery editing helpers ──────────────────────────────────────────────────
+
+    fn handle_gallery_t_press(&mut self) {
+        if self.edit_galleries.is_empty() || self.collection.is_empty() {
+            return;
+        }
+        if self.edit_galleries.len() == 1 {
+            // Direct toggle without selector
+            let idx = self.viewer.focused_index();
+            let path = self.collection.entries[idx].path.clone();
+            let hash = self.collection.entries[idx].hash.clone();
+            let added = self.edit_galleries[0].toggle(&path, &hash);
+            let save_result = self.edit_galleries[0].save();
+            let name = self.edit_galleries[0].name.clone();
+            if let Err(e) = save_result {
+                self.overlay.push_toast(format!("Save error: {e}"));
+            } else {
+                self.overlay.push_toast(if added {
+                    format!("Added to {name}")
+                } else {
+                    format!("Removed from {name}")
+                });
+            }
+        } else {
+            // Multiple galleries: open/close the selector
+            self.gallery_selector_open = !self.gallery_selector_open;
+            if self.gallery_selector_open {
+                self.gallery_selector_cursor = 0;
+            }
+        }
+    }
+
+    fn toggle_at_cursor(&mut self) {
+        if self.collection.is_empty() {
+            return;
+        }
+        let cursor = self.gallery_selector_cursor;
+        if cursor >= self.edit_galleries.len() {
+            return;
+        }
+        let idx = self.viewer.focused_index();
+        let path = self.collection.entries[idx].path.clone();
+        let hash = self.collection.entries[idx].hash.clone();
+        self.edit_galleries[cursor].toggle(&path, &hash);
+        let save_result = self.edit_galleries[cursor].save();
+        if let Err(e) = save_result {
+            self.overlay.push_toast(format!("Save error: {e}"));
+        }
+    }
+
+    /// Render the floating gallery-membership selector (when open).
+    fn render_gallery_selector(&mut self, ctx: &egui::Context) {
+        if !self.gallery_selector_open || self.collection.is_empty() {
+            return;
+        }
+        let focused_idx = self.viewer.focused_index();
+        let focused_path = self.collection.entries[focused_idx].path.clone();
+        let filename = focused_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+
+        // Collect display data before the closure to avoid borrow conflicts.
+        let items: Vec<(String, bool)> = self
+            .edit_galleries
+            .iter()
+            .map(|eg| (eg.name.clone(), eg.contains(&focused_path)))
+            .collect();
+        let cursor = self.gallery_selector_cursor;
+
+        let mut toggle_at: Option<usize> = None;
+
+        egui::Window::new("Edit galleries")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(&filename)
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.separator();
+                for (i, (name, is_member)) in items.iter().enumerate() {
+                    let mark = if *is_member { "✓" } else { "  " };
+                    let resp = ui.selectable_label(i == cursor, format!("{mark}  {name}"));
+                    if resp.clicked() {
+                        toggle_at = Some(i);
+                    }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("↑↓  Space toggle  T/Esc close")
+                        .size(10.0)
+                        .color(egui::Color32::DARK_GRAY),
+                );
+            });
+
+        if let Some(i) = toggle_at {
+            self.gallery_selector_cursor = i;
+            self.toggle_at_cursor();
+        }
+    }
+
+    // ── Slideshow / prefetch / rendering ────────────────────────────────────────
+
+    fn tick_slideshow(&mut self, ctx: &egui::Context) {
+        if !self.app_state.slideshow_active {
+            return;
+        }
+        let interval =
+            Duration::from_secs_f64(self.config.general.slideshow_interval_secs);
+        let elapsed = self.app_state.slideshow_last_at.elapsed();
+        if elapsed >= interval {
+            self.viewer
+                .navigate(crate::viewer::Direction::Next, 1, self.collection.len());
+            self.app_state.slideshow_last_at = std::time::Instant::now();
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(interval - elapsed);
+        }
+    }
+
+    /// Compose the effective filter stack for photo `idx`:
+    /// gallery pre-filters → per-photo filters → gallery post-filters.
+    fn effective_filters(&self, idx: usize) -> Vec<Filter> {
+        let photo = &self.collection.entries[idx].data.filters;
+        match self.collection.galerie_filters() {
+            None => photo.clone(),
+            Some((pre, post)) => {
+                let mut v = Vec::with_capacity(pre.len() + photo.len() + post.len());
+                v.extend_from_slice(&pre);
+                v.extend_from_slice(photo);
+                v.extend_from_slice(&post);
+                v
+            }
+        }
+    }
+
+    fn prefetch_visible(&mut self, ctx: &egui::Context) {
+        let total = self.collection.len();
+        let max_size = match &self.viewer {
+            ViewerState::Single(_) => None,
+            ViewerState::Tiling(_) => {
+                let phys = (self.last_tiling_cell_size * ctx.pixels_per_point()).round() as u32;
+                Some(phys.max(64))
+            }
+        };
+        for idx in self.viewer.visible_indices(total) {
+            let path = self.collection.entries[idx].path.clone();
+            let filters = self.effective_filters(idx);
+            self.cache.get_or_request(idx, &path, &filters, max_size, ctx);
+        }
+    }
+
+    fn render_single(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.collection.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No images found.");
+            });
+            return;
+        }
+
+        let idx = self.viewer.focused_index();
+        let path = self.collection.entries[idx].path.clone();
+        let rating = self.collection.entries[idx].data.rating;
+        let filters = self.effective_filters(idx);
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+
+        let avail = ui.available_rect_before_wrap();
+
+        // Interact for zoom (scroll) and pan (drag) — allocated over the full panel.
+        let resp = ui.interact(avail, egui::Id::new("single_view"), egui::Sense::click_and_drag());
+        if resp.dragged() {
+            if let ViewerState::Single(s) = &mut self.viewer {
+                let d = resp.drag_delta();
+                s.pan[0] += d.x;
+                s.pan[1] += d.y;
+            }
+        }
+        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll_y != 0.0 {
+            let delta = scroll_y / 100.0;
+            self.viewer.zoom_single(delta);
+        }
+
+        // Context menu (right-click).
+        let path_clone = path.clone();
+        let filters_clone = filters.clone();
+        resp.context_menu(|ui| {
+            if ui.button("Copy source path").clicked() {
+                ui.ctx().copy_text(path_clone.to_string_lossy().to_string());
+                ui.close_menu();
+            }
+            if ui.button("Copy image (PNG)").clicked() {
+                let _ = copy_image_to_clipboard(&path_clone, &filters_clone);
+                ui.close_menu();
+            }
+            if ui.button("Export (apply filters) & copy path").clicked() {
+                match export_to_temp(&path_clone, &filters_clone) {
+                    Ok(tmp) => ui.ctx().copy_text(tmp.to_string_lossy().to_string()),
+                    Err(e) => { let _ = e; }
+                }
+                ui.close_menu();
+            }
+        });
+
+        match self.cache.get_or_request(idx, &path, &filters, None, ctx) {
+            LoadState::Ready(tex) => {
+                let size = tex.size();
+                let ratio = size[0] as f32 / size[1] as f32;
+                let fit = fit_rect(avail, ratio);
+
+                // Handle zoom-to-one: set zoom so 1 image pixel = 1 screen pixel.
+                if self.app_state.zoom_to_one_pending {
+                    let scale = size[0] as f32 / fit.width();
+                    if let ViewerState::Single(s) = &mut self.viewer {
+                        s.zoom = scale;
+                        s.pan = [0.0, 0.0];
+                    }
+                    self.app_state.zoom_to_one_pending = false;
+                }
+
+                let (zoom, pan) = if let ViewerState::Single(s) = &self.viewer {
+                    (s.zoom, egui::vec2(s.pan[0], s.pan[1]))
+                } else {
+                    (1.0, egui::Vec2::ZERO)
+                };
+
+                let draw_rect = if (zoom - 1.0).abs() < 1e-4 && pan == egui::Vec2::ZERO {
+                    fit
+                } else {
+                    egui::Rect::from_center_size(avail.center() + pan, fit.size() * zoom)
+                };
+
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
+                if self.overlay.show_filename {
+                    OverlayState::render_filename(ui, draw_rect, &filename);
+                }
+                if self.overlay.show_rating {
+                    OverlayState::render_rating(ui, draw_rect, rating);
+                }
+                // Gallery membership badge (bottom-left, above filename if shown)
+                if !self.edit_galleries.is_empty() {
+                    self.render_membership_badge(ui, draw_rect, &path);
+                }
+                // Histogram overlay (bottom-right, anchored to viewport not image)
+                if self.app_state.show_histogram {
+                    if let Some(hist) = self.cache.get_histogram(idx) {
+                        render_histogram_overlay(ui, avail, hist);
+                    }
+                }
+            }
+            LoadState::Pending | LoadState::NotRequested => {
+                ui.centered_and_justified(|ui| {
+                    ui.spinner();
+                });
+            }
+            LoadState::Error(e) => {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Error: {e}"))
+                            .color(egui::Color32::RED),
+                    );
+                });
+            }
+        }
+    }
+
+    /// Draw a small membership list at the bottom-left of `rect` in single mode.
+    fn render_membership_badge(&self, ui: &egui::Ui, rect: egui::Rect, path: &std::path::Path) {
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(11.0);
+        let line_h = 14.0;
+        let pad = 4.0;
+
+        let mut y = rect.max.y - pad;
+        for eg in &self.edit_galleries {
+            let (mark, color) = if eg.contains(path) {
+                ("✓", egui::Color32::from_rgb(255, 200, 60))
+            } else {
+                ("·", egui::Color32::from_rgba_unmultiplied(200, 200, 200, 120))
+            };
+            y -= line_h;
+            painter.text(
+                egui::pos2(rect.min.x + pad, y),
+                egui::Align2::LEFT_TOP,
+                format!("{mark} {}", eg.name),
+                font.clone(),
+                color,
+            );
+        }
+    }
+
+    fn render_tiling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.collection.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No images found.");
+            });
+            return;
+        }
+
+        let total = self.collection.len();
+        let (page, cols, selected_in_page) = match &self.viewer {
+            ViewerState::Tiling(s) => (s.page, s.cols, s.selected),
+            ViewerState::Single(_) => unreachable!(),
+        };
+        let tile_count = cols * cols;
+        let start = page * tile_count;
+        let end = (start + tile_count).min(total);
+        let focused_abs = (start + selected_in_page).min(total - 1);
+
+        // Header
+        ui.horizontal(|ui| {
+            let total_pages = total.div_ceil(tile_count);
+            let fname = self.collection.entries[focused_abs]
+                .path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Page {}/{total_pages}  ·  {focused_abs}/{total}  ·  {fname}",
+                    page + 1
+                ))
+                .size(12.0)
+                .color(egui::Color32::GRAY),
+            );
+        });
+
+        let available_w = ui.available_width();
+        let spacing = 2.0;
+        let cell_size = (available_w - spacing * (cols as f32 - 1.0)) / cols as f32;
+        self.last_tiling_cell_size = cell_size;
+        let tile_max_size = Some(((cell_size * ui.ctx().pixels_per_point()).round() as u32).max(64));
+        let cell_sz = egui::vec2(cell_size, cell_size);
+
+        // Collect tile data before the grid (avoids borrow conflicts).
+        let gal_info = self.collection.galerie_filters(); // Option<(Vec<Filter>, GalleryFilterPosition)>
+        let entries: Vec<_> = (start..end)
+            .map(|i| {
+                let e = &self.collection.entries[i];
+                let in_edit = self.edit_galleries.iter().any(|eg| eg.contains(&e.path));
+                let filters = compose_filters(&e.data.filters, gal_info.as_ref());
+                (i, e.path.clone(), e.data.rating, filters, in_edit)
+            })
+            .collect();
+
+        let mut clicked_idx: Option<usize> = None;
+        let mut selected_rect: Option<egui::Rect> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("tile_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("tile_grid")
+                    .num_columns(cols)
+                    .spacing([spacing, spacing])
+                    .show(ui, |ui| {
+                        for (tile_in_page, (idx, path, rating, filters, in_edit)) in entries.into_iter().enumerate() {
+                            let is_selected = tile_in_page == selected_in_page;
+                            let load_state = self.cache.get_or_request(idx, &path, &filters, tile_max_size, ctx);
+                            let response = self.render_tile(ui, load_state, rating, cell_sz, is_selected, in_edit);
+                            if is_selected {
+                                selected_rect = Some(response.rect);
+                            }
+                            if response.clicked() {
+                                clicked_idx = Some(idx);
+                            }
+                            if (tile_in_page + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                if self.app_state.needs_scroll_to_selection {
+                    if let Some(rect) = selected_rect {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    self.app_state.needs_scroll_to_selection = false;
+                }
+            });
+
+        if let Some(idx) = clicked_idx {
+            self.viewer.switch_to_single(idx);
+        }
+    }
+
+    fn render_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        load_state: LoadState,
+        rating: Option<u8>,
+        cell_sz: egui::Vec2,
+        is_selected: bool,
+        in_edit_gallery: bool,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(cell_sz, egui::Sense::click());
+
+        ui.painter().rect_filled(rect, 0.0, self.bg_color());
+
+        match load_state {
+            LoadState::Ready(tex) => {
+                let size = tex.size();
+                let ratio = size[0] as f32 / size[1] as f32;
+                let fit = fit_rect(rect, ratio);
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), fit, uv, egui::Color32::WHITE);
+                if self.overlay.show_rating {
+                    OverlayState::render_rating(ui, rect, rating);
+                }
+            }
+            LoadState::Pending | LoadState::NotRequested => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "⏳",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::GRAY,
+                );
+            }
+            LoadState::Error(_) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "✗",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::RED,
+                );
+            }
+        }
+
+        // Gallery membership: small amber dot in the top-right corner.
+        if in_edit_gallery {
+            let dot_size = (cell_sz.x * 0.08).clamp(5.0, 12.0);
+            let dot_pos = egui::pos2(rect.max.x - dot_size - 2.0, rect.min.y + 2.0);
+            ui.painter().circle_filled(
+                dot_pos + egui::vec2(dot_size / 2.0, dot_size / 2.0),
+                dot_size / 2.0,
+                egui::Color32::from_rgb(255, 190, 30),
+            );
+        }
+
+        // Selection / hover border (drawn on top of everything else).
+        if is_selected {
+            ui.painter().rect_stroke(
+                rect, 0.0,
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(100, 200, 255)),
+                egui::StrokeKind::Middle,
+            );
+        } else if response.hovered() {
+            ui.painter().rect_stroke(
+                rect, 0.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Middle,
+            );
+        }
+
+        response
+    }
+    // ── Filter sidebar ──────────────────────────────────────────────────────────
+
+    fn render_filter_sidebar(&mut self, ctx: &egui::Context) {
+        if !self.app_state.filter_sidebar_open { return; }
+        let is_single = matches!(&self.viewer, ViewerState::Single(_));
+        if self.collection.is_empty() { return; }
+
+        // ── Gallery-level filter state ──────────────────────────────────────────
+        let gal_path = self.collection.single_galerie_path();
+        let (mut gal_pre, mut gal_post) = self.collection
+            .galerie_filters()
+            .unwrap_or_else(|| (vec![], vec![]));
+        let mut gal_changed = false;
+        // (tag, index, open) — tag distinguishes pre ("pre") from post ("post")
+        let mut gal_toggle_req: Option<(&str, usize, bool)> = None;
+        let mut gal_pre_remove: Option<usize> = None;
+        let mut gal_post_remove: Option<usize> = None;
+        let mut gal_pre_add: Option<Filter> = None;
+        let mut gal_post_add: Option<Filter> = None;
+
+        // ── Per-photo filter state ──────────────────────────────────────────────
+        let idx = if is_single { Some(self.viewer.focused_index()) } else { None };
+        let photo_histogram: Option<ImageHistogram> = idx.and_then(|i| self.cache.get_histogram(i).cloned());
+        let mut new_filters = idx
+            .map(|i| self.collection.entries[i].data.filters.clone())
+            .unwrap_or_default();
+        let mut photo_changed = false;
+        let mut photo_toggle_req: Option<(usize, bool)> = None;
+        let mut photo_to_remove: Option<usize> = None;
+        let mut photo_to_add: Option<Filter> = None;
+
+        let acc = self.filter_accordion_open.clone();
+        let acc_pre = self.gallery_pre_accordion_open.clone();
+        let acc_post = self.gallery_post_accordion_open.clone();
+
+        egui::SidePanel::right("filter_sidebar")
+            .resizable(true)
+            .min_width(210.0)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+
+                        // ── Gallery pre-filters ─────────────────────────────────
+                        if gal_path.is_some() {
+                            ui.strong("Before photo filters");
+                            ui.label(egui::RichText::new("Applied before each photo's own filters").color(egui::Color32::GRAY).small());
+                            ui.add_space(2.0);
+                            if gal_pre.is_empty() {
+                                ui.label(egui::RichText::new("(none)").color(egui::Color32::GRAY).italics());
+                            }
+                            for (i, filter) in gal_pre.iter_mut().enumerate() {
+                                let kind = filter_kind_name(filter);
+                                let is_open = acc_pre.contains(&i);
+                                let has_params = filter_has_params(filter);
+                                ui.horizontal(|ui| {
+                                    if has_params {
+                                        if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
+                                            gal_toggle_req = Some(("pre", i, !is_open));
+                                        }
+                                    } else { ui.add_space(18.0); }
+                                    ui.strong(kind);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Remove").clicked() { gal_pre_remove = Some(i); }
+                                    });
+                                });
+                                if is_open && has_params {
+                                    ui.indent(egui::Id::new(("gpre", i)), |ui| {
+                                        if render_filter_params(ui, filter, None) { gal_changed = true; }
+                                    });
+                                }
+                                ui.add_space(2.0);
+                            }
+                            ui.label(egui::RichText::new("Add:").color(egui::Color32::GRAY).small());
+                            ui.horizontal_wrapped(|ui| {
+                                for (label, default) in filter_add_list() {
+                                    if ui.small_button(label).clicked() { gal_pre_add = Some(default); }
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                        }
+
+                        // ── Per-photo filters ───────────────────────────────────
+                        if is_single {
+                            ui.strong("Photo filters");
+                            ui.add_space(2.0);
+                            if new_filters.is_empty() {
+                                ui.label(egui::RichText::new("(none)").color(egui::Color32::GRAY).italics());
+                            }
+                            for (i, filter) in new_filters.iter_mut().enumerate() {
+                                let kind = filter_kind_name(filter);
+                                let is_open = acc.contains(&i);
+                                let has_params = filter_has_params(filter);
+                                ui.horizontal(|ui| {
+                                    if has_params {
+                                        if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
+                                            photo_toggle_req = Some((i, !is_open));
+                                        }
+                                    } else { ui.add_space(18.0); }
+                                    ui.strong(kind);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Remove").clicked() { photo_to_remove = Some(i); }
+                                    });
+                                });
+                                if is_open && has_params {
+                                    ui.indent(egui::Id::new(("fp", i)), |ui| {
+                                        if render_filter_params(ui, filter, photo_histogram.as_ref()) { photo_changed = true; }
+                                    });
+                                }
+                                ui.add_space(2.0);
+                            }
+                            ui.label(egui::RichText::new("Add:").color(egui::Color32::GRAY).small());
+                            ui.horizontal_wrapped(|ui| {
+                                for (label, default) in filter_add_list() {
+                                    if ui.small_button(label).clicked() { photo_to_add = Some(default); }
+                                }
+                            });
+                        } else if gal_path.is_none() {
+                            ui.label(egui::RichText::new("Open single-photo view to edit photo filters.").color(egui::Color32::GRAY).italics());
+                        }
+
+                        // ── Gallery post-filters ────────────────────────────────
+                        if gal_path.is_some() {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.strong("After photo filters");
+                            ui.label(egui::RichText::new("Applied after each photo's own filters").color(egui::Color32::GRAY).small());
+                            ui.add_space(2.0);
+                            if gal_post.is_empty() {
+                                ui.label(egui::RichText::new("(none)").color(egui::Color32::GRAY).italics());
+                            }
+                            for (i, filter) in gal_post.iter_mut().enumerate() {
+                                let kind = filter_kind_name(filter);
+                                let is_open = acc_post.contains(&i);
+                                let has_params = filter_has_params(filter);
+                                ui.horizontal(|ui| {
+                                    if has_params {
+                                        if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
+                                            gal_toggle_req = Some(("post", i, !is_open));
+                                        }
+                                    } else { ui.add_space(18.0); }
+                                    ui.strong(kind);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Remove").clicked() { gal_post_remove = Some(i); }
+                                    });
+                                });
+                                if is_open && has_params {
+                                    ui.indent(egui::Id::new(("gpost", i)), |ui| {
+                                        if render_filter_params(ui, filter, None) { gal_changed = true; }
+                                    });
+                                }
+                                ui.add_space(2.0);
+                            }
+                            ui.label(egui::RichText::new("Add:").color(egui::Color32::GRAY).small());
+                            ui.horizontal_wrapped(|ui| {
+                                for (label, default) in filter_add_list() {
+                                    if ui.small_button(label).clicked() { gal_post_add = Some(default); }
+                                }
+                            });
+                        }
+                    });
+            });
+
+        // ── Apply gallery-filter changes ────────────────────────────────────────
+        if let Some((tag, i, open)) = gal_toggle_req {
+            let set = if tag == "pre" { &mut self.gallery_pre_accordion_open } else { &mut self.gallery_post_accordion_open };
+            if open { set.insert(i); } else { set.remove(&i); }
+        }
+        if let Some(i) = gal_pre_remove {
+            gal_pre.remove(i);
+            self.gallery_pre_accordion_open = accordion_after_remove(&self.gallery_pre_accordion_open, i);
+            gal_changed = true;
+        }
+        if let Some(i) = gal_post_remove {
+            gal_post.remove(i);
+            self.gallery_post_accordion_open = accordion_after_remove(&self.gallery_post_accordion_open, i);
+            gal_changed = true;
+        }
+        if let Some(f) = gal_pre_add {
+            self.gallery_pre_accordion_open.insert(gal_pre.len());
+            gal_pre.push(f);
+            gal_changed = true;
+        }
+        if let Some(f) = gal_post_add {
+            self.gallery_post_accordion_open.insert(gal_post.len());
+            gal_post.push(f);
+            gal_changed = true;
+        }
+        if gal_changed {
+            if let Some(ref path) = gal_path {
+                if let Err(e) = self.collection.set_galerie_filters(path, gal_pre, gal_post) {
+                    self.overlay.push_toast(format!("Gallery filter error: {e}"));
+                } else {
+                    self.cache.invalidate_all();
+                }
+            }
+        }
+
+        // ── Apply per-photo filter changes ──────────────────────────────────────
+        if let Some((i, open)) = photo_toggle_req {
+            if open { self.filter_accordion_open.insert(i); } else { self.filter_accordion_open.remove(&i); }
+        }
+        if let Some(i) = photo_to_remove {
+            new_filters.remove(i);
+            self.filter_accordion_open = accordion_after_remove(&self.filter_accordion_open, i);
+            photo_changed = true;
+        }
+        if let Some(f) = photo_to_add {
+            self.filter_accordion_open.insert(new_filters.len());
+            new_filters.push(f);
+            photo_changed = true;
+        }
+        if photo_changed {
+            if let Some(i) = idx {
+                let mut new_data = self.collection.entries[i].data.clone();
+                new_data.filters = new_filters;
+                if let Err(e) = self.collection.update_data(i, new_data) {
+                    self.overlay.push_toast(format!("Filter error: {e}"));
+                } else {
+                    self.cache.invalidate(i);
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for GalerieApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 1. Poll image cache
+        self.cache.poll(ctx);
+
+        // 2. Poll script results
+        while let Ok(res) = self.script_result_rx.try_recv() {
+            let msg = if res.success {
+                res.output
+            } else {
+                format!("Script failed: {}", res.output)
+            };
+            self.overlay.push_toast(msg);
+            self.app_state.script_running = false;
+        }
+
+        // 3. Handle keyboard input
+        self.handle_input(ctx);
+
+        // 4. Slideshow advance
+        self.tick_slideshow(ctx);
+
+        // 5. Quit
+        if self.app_state.should_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // 6. Prefetch visible images
+        self.prefetch_visible(ctx);
+
+        // 7. Render top bar
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let mode_label = match &self.viewer {
+                    ViewerState::Tiling(s) => format!("⊞ {}×{}", s.cols, s.cols),
+                    ViewerState::Single(_) => "⬛ Single".to_owned(),
+                };
+                ui.label(egui::RichText::new(mode_label).size(12.0).color(egui::Color32::LIGHT_GRAY));
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("{} photos", self.collection.len()))
+                        .size(12.0)
+                        .color(egui::Color32::GRAY),
+                );
+                if !self.edit_galleries.is_empty() {
+                    ui.separator();
+                    let label = if self.edit_galleries.len() == 1 {
+                        format!("✏ {}", self.edit_galleries[0].name)
+                    } else {
+                        format!("✏ {} galleries", self.edit_galleries.len())
+                    };
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(255, 190, 30)),
+                    );
+                }
+                if self.app_state.slideshow_active {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("▶")
+                            .size(12.0)
+                            .color(egui::Color32::GREEN),
+                    );
+                    let mut interval = self.config.general.slideshow_interval_secs as f32;
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut interval)
+                            .range(0.5f32..=60.0)
+                            .speed(0.1)
+                            .suffix("s"),
+                    );
+                    if resp.changed() {
+                        self.config.general.slideshow_interval_secs = interval as f64;
+                    }
+                }
+                if self.app_state.script_running {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Running script…").size(12.0).color(egui::Color32::YELLOW));
+                }
+
+                // Right-aligned controls
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if matches!(&self.viewer, ViewerState::Single(_)) {
+                        let btn = egui::Button::new(
+                            egui::RichText::new("Hist").size(12.0),
+                        )
+                        .selected(self.app_state.show_histogram);
+                        if ui.add(btn).on_hover_text("Toggle histogram (I)").clicked() {
+                            self.app_state.show_histogram = !self.app_state.show_histogram;
+                        }
+                    }
+                });
+            });
+        });
+
+        // 8. Filter sidebar (single mode; must precede CentralPanel)
+        self.render_filter_sidebar(ctx);
+
+        // 9. Main content
+        let bg = self.bg_color();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ctx.style().as_ref()).fill(bg))
+            .show(ctx, |ui| {
+            let viewer_clone = self.viewer.clone();
+            match viewer_clone {
+                ViewerState::Tiling(_) => self.render_tiling(ui, ctx),
+                ViewerState::Single(_) => self.render_single(ui, ctx),
+            }
+        });
+
+        // 9. Gallery selector overlay (rendered as a floating window on top)
+        self.render_gallery_selector(ctx);
+
+        // 10. Toast overlay
+        self.overlay.render_toast(ctx);
+    }
+}
+
+// ── Filter sidebar helpers ──────────────────────────────────────────────────────
+
+/// Rebuild an index-keyed accordion set after removing the entry at `removed`,
+/// shifting all higher indices down by one.
+fn accordion_after_remove(set: &HashSet<usize>, removed: usize) -> HashSet<usize> {
+    set.iter()
+        .filter(|&&j| j != removed)
+        .map(|&j| if j > removed { j - 1 } else { j })
+        .collect()
+}
+
+/// Compose effective filter stack: pre → photo → post.
+fn compose_filters(photo: &[Filter], gallery: Option<&(Vec<Filter>, Vec<Filter>)>) -> Vec<Filter> {
+    match gallery {
+        None => photo.to_vec(),
+        Some((pre, post)) => {
+            let mut v = Vec::with_capacity(pre.len() + photo.len() + post.len());
+            v.extend_from_slice(pre);
+            v.extend_from_slice(photo);
+            v.extend_from_slice(post);
+            v
+        }
+    }
+}
+
+fn filter_kind_name(filter: &Filter) -> &'static str {
+    match filter {
+        Filter::Rotate { .. }       => "Rotate",
+        Filter::FlipHorizontal      => "Flip H",
+        Filter::FlipVertical        => "Flip V",
+        Filter::Crop { .. }         => "Crop",
+        Filter::Scale { .. }        => "Scale",
+        Filter::Exposure { .. }     => "Exposure",
+        Filter::Contrast { .. }     => "Contrast",
+        Filter::CapSize { .. }      => "Cap Size",
+        Filter::Border { .. }       => "Border",
+        Filter::Sharpen { .. }      => "Sharpen",
+        Filter::MicroContrast { .. } => "Clarity",
+        Filter::Curves { .. }       => "Curves",
+    }
+}
+
+fn filter_has_params(filter: &Filter) -> bool {
+    !matches!(filter, Filter::FlipHorizontal | Filter::FlipVertical)
+}
+
+/// Default instances for the "Add filter" buttons, in display order.
+fn filter_add_list() -> Vec<(&'static str, Filter)> {
+    vec![
+        ("Rotate",    Filter::Rotate { degrees: 0, center: None, fill: RotateFill::Transparent }),
+        ("Flip H",    Filter::FlipHorizontal),
+        ("Flip V",    Filter::FlipVertical),
+        ("Crop",      Filter::Crop { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }),
+        ("Scale",     Filter::Scale { factor: 1.0 }),
+        ("Exposure",  Filter::Exposure { stops: 0.0 }),
+        ("Contrast",  Filter::Contrast { factor: 1.0 }),
+        ("Sharpen",   Filter::Sharpen { amount: 1.0 }),
+        ("Clarity",   Filter::MicroContrast { amount: 0.5 }),
+        ("Curves",    Filter::Curves {
+            r: vec![[0.0, 0.0], [1.0, 1.0]],
+            g: vec![[0.0, 0.0], [1.0, 1.0]],
+            b: vec![[0.0, 0.0], [1.0, 1.0]],
+        }),
+        ("Cap Size",  Filter::CapSize { max_px: 1024 }),
+        ("Border",    Filter::Border { thickness: 20, color: [255, 255, 255, 255] }),
+    ]
+}
+
+/// Render editable parameters for `filter`. Returns `true` if any value changed.
+fn render_filter_params(ui: &mut egui::Ui, filter: &mut Filter, histogram: Option<&ImageHistogram>) -> bool {
+    match filter {
+        Filter::Rotate { degrees, center, fill } => {
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for d in [0i32, 90, 180, 270] {
+                    if ui.radio_value(degrees, d, format!("{d}°")).changed() {
+                        changed = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(degrees).suffix("°"))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(degrees, -180..=180).show_value(false))
+                    .changed();
+            });
+            // Fill mode (only meaningful for non-90° angles)
+            ui.label("Fill:");
+            ui.horizontal(|ui| {
+                if ui.radio(matches!(fill, RotateFill::Transparent), "Transparent").clicked() {
+                    *fill = RotateFill::Transparent;
+                    changed = true;
+                }
+                if ui.radio(matches!(fill, RotateFill::Crop), "Crop").clicked() {
+                    *fill = RotateFill::Crop;
+                    changed = true;
+                }
+                if ui.radio(matches!(fill, RotateFill::Color(_)), "Color").clicked() {
+                    if !matches!(fill, RotateFill::Color(_)) {
+                        *fill = RotateFill::Color([0, 0, 0, 255]);
+                        changed = true;
+                    }
+                }
+            });
+            if let RotateFill::Color(c) = fill {
+                let mut color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    let [r, g, b, a] = color.to_array();
+                    *c = [r, g, b, a];
+                    changed = true;
+                }
+            }
+            // Custom centre of rotation
+            let mut has_center = center.is_some();
+            if ui.checkbox(&mut has_center, "Custom center").changed() {
+                *center = if has_center { Some([0.5, 0.5]) } else { None };
+                changed = true;
+            }
+            if let Some([cx, cy]) = center {
+                changed |= ui
+                    .add(egui::Slider::new(cx, 0.0f32..=1.0).text("X").step_by(0.01))
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(cy, 0.0f32..=1.0).text("Y").step_by(0.01))
+                    .changed();
+            }
+            changed
+        }
+        Filter::FlipHorizontal | Filter::FlipVertical => false,
+        Filter::Crop { x, y, width, height } => {
+            let mut changed = false;
+            changed |= ui
+                .add(egui::Slider::new(x, 0.0f32..=0.95).text("left").step_by(0.01))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(y, 0.0f32..=0.95).text("top").step_by(0.01))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(width, 0.05f32..=1.0).text("width").step_by(0.01))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(height, 0.05f32..=1.0).text("height").step_by(0.01))
+                .changed();
+            changed
+        }
+        Filter::Scale { factor } => ui
+            .add(egui::Slider::new(factor, 0.05f32..=2.0).text("×").step_by(0.05))
+            .changed(),
+        Filter::Exposure { stops } => ui
+            .add(egui::Slider::new(stops, -4.0f32..=4.0).text("EV").step_by(0.1))
+            .changed(),
+        Filter::Contrast { factor } => ui
+            .add(egui::Slider::new(factor, 0.1f32..=3.0).text("×").step_by(0.05))
+            .changed(),
+        Filter::CapSize { max_px } => {
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for &preset in &[120u32, 600, 800, 1200] {
+                    if ui.small_button(preset.to_string()).clicked() {
+                        *max_px = preset;
+                        changed = true;
+                    }
+                }
+            });
+            changed |= ui
+                .add(egui::Slider::new(max_px, 64u32..=4096).text("px").logarithmic(true))
+                .changed();
+            changed
+        }
+        Filter::Border { thickness, color } => {
+            let mut changed = false;
+            changed |= ui
+                .add(egui::Slider::new(thickness, 1u32..=500).text("px"))
+                .changed();
+            let mut c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+            if egui::color_picker::color_edit_button_srgba(
+                ui,
+                &mut c,
+                egui::color_picker::Alpha::OnlyBlend,
+            )
+            .changed()
+            {
+                *color = c.to_array();
+                changed = true;
+            }
+            changed
+        }
+        Filter::Sharpen { amount } => ui
+            .add(egui::Slider::new(amount, -1.0f32..=5.0).text("amount").step_by(0.05))
+            .changed(),
+        Filter::MicroContrast { amount } => ui
+            .add(egui::Slider::new(amount, -1.0f32..=2.0).text("clarity").step_by(0.05))
+            .changed(),
+        Filter::Curves { r, g, b } => {
+            let mut changed = false;
+            ui.label(egui::RichText::new("R").color(egui::Color32::from_rgb(220, 80, 80)).small());
+            let r_hist = histogram.map(|h| &h.r);
+            let mut w = CurveEditor::new("curve_r", r, egui::Color32::from_rgb(220, 80, 80));
+            if let Some(h) = r_hist { w = w.histogram(h); }
+            changed |= ui.add(w).changed();
+
+            ui.label(egui::RichText::new("G").color(egui::Color32::from_rgb(80, 180, 80)).small());
+            let g_hist = histogram.map(|h| &h.g);
+            let mut w = CurveEditor::new("curve_g", g, egui::Color32::from_rgb(80, 180, 80));
+            if let Some(h) = g_hist { w = w.histogram(h); }
+            changed |= ui.add(w).changed();
+
+            ui.label(egui::RichText::new("B").color(egui::Color32::from_rgb(80, 120, 220)).small());
+            let b_hist = histogram.map(|h| &h.b);
+            let mut w = CurveEditor::new("curve_b", b, egui::Color32::from_rgb(80, 120, 220));
+            if let Some(h) = b_hist { w = w.histogram(h); }
+            changed |= ui.add(w).changed();
+            changed
+        }
+    }
+}
+
+
+fn render_histogram_overlay(ui: &egui::Ui, photo_rect: egui::Rect, hist: &ImageHistogram) {
+    const HIST_W: f32 = 220.0;
+    const HIST_H: f32 = 80.0;
+    const PAD: f32 = 8.0;
+
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(photo_rect.max.x - HIST_W - PAD, photo_rect.max.y - HIST_H - PAD),
+        egui::pos2(photo_rect.max.x - PAD, photo_rect.max.y - PAD),
+    );
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(160));
+
+    let max_val = [hist.r.iter(), hist.g.iter(), hist.b.iter()]
+        .into_iter()
+        .flatten()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let max_log = (max_val + 1.0).ln();
+    let bar_w = rect.width() / 256.0;
+
+    for (channel, color) in [
+        (&hist.r, egui::Color32::from_rgba_unmultiplied(255, 60, 60, 160)),
+        (&hist.g, egui::Color32::from_rgba_unmultiplied(60, 220, 60, 140)),
+        (&hist.b, egui::Color32::from_rgba_unmultiplied(60, 100, 255, 160)),
+    ] {
+        for (i, &count) in channel.iter().enumerate() {
+            if count == 0 { continue; }
+            let norm_h = ((count as f64 + 1.0).ln() / max_log) as f32;
+            let bar_h = norm_h * rect.height();
+            let x = rect.min.x + i as f32 * bar_w;
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(x, rect.max.y - bar_h),
+                egui::pos2(x + bar_w, rect.max.y),
+            );
+            painter.rect_filled(bar_rect, 0.0, color);
+        }
+    }
+
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(60)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Copy the filter-processed image to the system clipboard as image/png data.
+fn copy_image_to_clipboard(path: &std::path::Path, filters: &[Filter]) -> Result<(), String> {
+    let img = crate::image_cache::load_and_process(path, filters)?;
+    let (w, h) = img.dimensions();
+    let bytes = img.into_raw(); // RGBA, row-major
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_image(arboard::ImageData {
+        width: w as usize,
+        height: h as usize,
+        bytes: std::borrow::Cow::Owned(bytes),
+    }).map_err(|e| e.to_string())
+}
+
+/// Apply the filter stack and save to a temp file. Returns the temp file path.
+fn export_to_temp(path: &std::path::Path, filters: &[Filter]) -> Result<std::path::PathBuf, String> {
+    let img = crate::image_cache::load_and_process(path, filters)?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+    let tmp = std::env::temp_dir().join(format!("{stem}_galerie.png"));
+    img.save(&tmp).map_err(|e| e.to_string())?;
+    Ok(tmp)
+}
