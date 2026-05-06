@@ -46,6 +46,8 @@ pub enum Action {
     ToggleFullscreen,
     /// Apply `filter` to every photo in the collection.
     ApplyFilterToAll { filter: Filter },
+    /// Toggle the annotations panel.
+    ToggleAnnotations,
 }
 
 impl Action {
@@ -269,6 +271,7 @@ impl Action {
                 };
                 Action::ApplyFilterToAll { filter }
             }
+            "ToggleAnnotations" => Action::ToggleAnnotations,
             "NavigateTilingRow" => {
                 let direction = table
                     .and_then(|t| t.get("direction"))
@@ -313,6 +316,7 @@ pub struct AppState {
     pub is_fullscreen: bool,
     /// Signals render_single to set zoom so 1 image pixel = 1 screen pixel.
     pub zoom_to_one_pending: bool,
+    pub show_annotations: bool,
 }
 
 impl Default for AppState {
@@ -328,6 +332,7 @@ impl Default for AppState {
             needs_scroll_to_selection: false,
             is_fullscreen: false,
             zoom_to_one_pending: false,
+            show_annotations: false,
         }
     }
 }
@@ -410,6 +415,9 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
         }
         Action::ApplyFilterToAll { filter } => {
             handle_apply_filter_to_all(filter.clone(), cx);
+        }
+        Action::ToggleAnnotations => {
+            cx.app_state.show_annotations = !cx.app_state.show_annotations;
         }
         Action::NavigateTilingRow { direction } => {
             let total = cx.collection.len();

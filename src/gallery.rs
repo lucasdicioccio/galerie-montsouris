@@ -9,6 +9,12 @@ use crate::filters::Filter;
 
 const SUPPORTED_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "tif", "tiff"];
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind")]
+pub enum Annotation {
+    Note { text: String },
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +64,8 @@ pub struct PhotoData {
     pub rating: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<Filter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<Annotation>,
 }
 
 /// One entry inside a `.galerie` named-gallery file.
@@ -273,9 +281,13 @@ impl PhotoCollection {
                 }
             };
 
-            // Rating comes from the directory sidecar (shared); filters are galerie-specific.
-            let sidecar_rating = cache.get(&dir).and_then(|s| s.get(&hash)).and_then(|d| d.rating);
-            let data = PhotoData { rating: sidecar_rating, filters: ge.filters.clone() };
+            // Rating and annotations come from the directory sidecar (shared); filters are galerie-specific.
+            let sidecar_entry = cache.get(&dir).and_then(|s| s.get(&hash)).cloned();
+            let data = PhotoData {
+                rating: sidecar_entry.as_ref().and_then(|d| d.rating),
+                filters: ge.filters.clone(),
+                annotations: sidecar_entry.map(|d| d.annotations).unwrap_or_default(),
+            };
 
             let index = self.entries.len();
             self.entries.push(PhotoEntry {
@@ -338,11 +350,11 @@ impl PhotoCollection {
         for e in &self.entries {
             if e.path.parent().map(|p| p == dir).unwrap_or(false) {
                 let sidecar_data = if e.galerie_source.is_some() {
-                    PhotoData { rating: e.data.rating, filters: vec![] }
+                    PhotoData { rating: e.data.rating, filters: vec![], annotations: e.data.annotations.clone() }
                 } else {
                     e.data.clone()
                 };
-                if sidecar_data.rating.is_some() || !sidecar_data.filters.is_empty() {
+                if sidecar_data.rating.is_some() || !sidecar_data.filters.is_empty() || !sidecar_data.annotations.is_empty() {
                     map.insert(e.hash.clone(), sidecar_data);
                 }
             }
@@ -582,7 +594,7 @@ mod tests {
         make_temp_jpeg(tmp.path(), "a.jpg");
         let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
         assert_eq!(col.entries[0].data.rating, None);
-        col.update_data(0, PhotoData { rating: Some(4), filters: vec![] }).unwrap();
+        col.update_data(0, PhotoData { rating: Some(4), ..Default::default() }).unwrap();
         let col2 = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
         assert_eq!(col2.entries[0].data.rating, Some(4));
     }
@@ -623,7 +635,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_temp_jpeg(tmp.path(), "original.jpg");
         let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        col.update_data(0, PhotoData { rating: Some(5), filters: vec![] }).unwrap();
+        col.update_data(0, PhotoData { rating: Some(5), ..Default::default() }).unwrap();
         std::fs::rename(tmp.path().join("original.jpg"), tmp.path().join("renamed.jpg")).unwrap();
         let col2 = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
         assert_eq!(col2.entries[0].data.rating, Some(5));
@@ -690,7 +702,7 @@ mod tests {
         make_temp_jpeg(tmp.path(), "a.jpg");
         let abs_a = tmp.path().join("a.jpg").canonicalize().unwrap();
         let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        col.update_data(0, PhotoData { rating: Some(2), filters: vec![] }).unwrap();
+        col.update_data(0, PhotoData { rating: Some(2), ..Default::default() }).unwrap();
         let hash_a = col.entries[0].hash.clone();
         let gal = GalleryFile {
             name: "g".to_owned(),
@@ -734,7 +746,7 @@ mod tests {
         // Apply new filter via update_data → should persist to galerie file
         let new_filters = vec![Filter::Rotate { degrees: 180, center: None, fill: RotateFill::Transparent }];
         let mut col = PhotoCollection::from_args(&[InputArg::GalleryFile(gal_path.clone())]).unwrap();
-        col.update_data(0, PhotoData { rating: None, filters: new_filters.clone() }).unwrap();
+        col.update_data(0, PhotoData { filters: new_filters.clone(), ..Default::default() }).unwrap();
 
         // Reload and confirm new filters are in the galerie file
         let col2 = PhotoCollection::from_args(&[InputArg::GalleryFile(gal_path)]).unwrap();

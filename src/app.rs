@@ -31,6 +31,10 @@ pub struct GalerieApp {
     last_tiling_cell_size: f32,
     /// Saved tiling `cols` so switching back from single mode restores the previous grid size.
     last_tiling_cols: usize,
+    /// Pending text for the annotation add-input box.
+    annotation_input: String,
+    /// Set to true when the annotation panel is opened — causes the text input to be focused.
+    annotation_focus_pending: bool,
     /// Which per-photo filter rows are expanded, keyed by position index.
     filter_accordion_open: HashSet<usize>,
     /// Same for the gallery pre-filter stack.
@@ -84,6 +88,8 @@ impl GalerieApp {
             gallery_selector_cursor: 0,
             last_tiling_cell_size: 200.0,
             last_tiling_cols: initial_cols,
+            annotation_input: String::new(),
+            annotation_focus_pending: false,
             filter_accordion_open: HashSet::new(),
             gallery_pre_accordion_open: HashSet::new(),
             gallery_post_accordion_open: HashSet::new(),
@@ -94,6 +100,19 @@ impl GalerieApp {
         // Keep last_tiling_cols in sync so switching back from single restores the grid size.
         if let ViewerState::Tiling(s) = &self.viewer {
             self.last_tiling_cols = s.cols;
+        }
+
+        // Don't process keybindings when a text field has keyboard focus.
+        if ctx.wants_keyboard_input() {
+            // Escape still closes the annotations panel even while typing.
+            if self.app_state.show_annotations {
+                ctx.input(|i| {
+                    if i.key_pressed(egui::Key::Escape) {
+                        self.app_state.show_annotations = false;
+                    }
+                });
+            }
+            return;
         }
 
         ctx.input(|i| {
@@ -140,6 +159,12 @@ impl GalerieApp {
                         continue;
                     }
 
+                    // ── Escape closes annotations panel before anything else ──────
+                    if *key == egui::Key::Escape && self.app_state.show_annotations {
+                        self.app_state.show_annotations = false;
+                        continue;
+                    }
+
                     // ── Escape exits fullscreen before doing anything else ────────
                     if *key == egui::Key::Escape && self.app_state.is_fullscreen {
                         self.app_state.is_fullscreen = false;
@@ -165,6 +190,11 @@ impl GalerieApp {
                     if let Some(action) = action {
                         if matches!(action, crate::actions::Action::CycleBackground) {
                             self.handle_cycle_background();
+                        } else if matches!(action, crate::actions::Action::ToggleAnnotations) {
+                            self.app_state.show_annotations = !self.app_state.show_annotations;
+                            if self.app_state.show_annotations {
+                                self.annotation_focus_pending = true;
+                            }
                         } else {
                             let tile_count = self.last_tiling_cols * self.last_tiling_cols;
                             let mut cx = ActionContext {
@@ -677,6 +707,110 @@ impl GalerieApp {
 
         response
     }
+    // ── Annotations panel ───────────────────────────────────────────────────────
+
+    fn render_annotations_panel(&mut self, ctx: &egui::Context) {
+        if !self.app_state.show_annotations || self.collection.is_empty() {
+            return;
+        }
+
+        let idx = self.viewer.focused_index();
+        let filename = self.collection.entries[idx]
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let current = self.collection.entries[idx].data.annotations.clone();
+
+        let mut to_remove: Option<usize> = None;
+        let mut add_text: Option<String> = None;
+        let mut close = false;
+
+        let mut open = self.app_state.show_annotations;
+        egui::Window::new("Annotations")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .min_width(280.0)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(&filename)
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(4.0);
+
+                if current.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No annotations yet.")
+                            .italics()
+                            .color(egui::Color32::GRAY),
+                    );
+                } else {
+                    use crate::gallery::Annotation;
+                    for (i, ann) in current.iter().enumerate() {
+                        let Annotation::Note { text } = ann;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("✎").color(egui::Color32::GRAY));
+                            ui.label(text);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("×").on_hover_text("Remove").clicked() {
+                                    to_remove = Some(i);
+                                }
+                            });
+                        });
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    let input = ui.add(
+                        egui::TextEdit::singleline(&mut self.annotation_input)
+                            .hint_text("Add note…")
+                            .desired_width(ui.available_width() - 50.0),
+                    );
+                    if self.annotation_focus_pending {
+                        input.request_focus();
+                        self.annotation_focus_pending = false;
+                    }
+                    let submit = ui.button("Add");
+                    let pressed_enter = input.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (submit.clicked() || pressed_enter) && !self.annotation_input.trim().is_empty() {
+                        add_text = Some(self.annotation_input.trim().to_owned());
+                        self.annotation_input.clear();
+                        input.request_focus();
+                    }
+                });
+            });
+
+        if !open {
+            close = true;
+        }
+        if close {
+            self.app_state.show_annotations = false;
+        }
+
+        if to_remove.is_some() || add_text.is_some() {
+            use crate::gallery::Annotation;
+            let mut new_data = self.collection.entries[idx].data.clone();
+            if let Some(i) = to_remove {
+                new_data.annotations.remove(i);
+            }
+            if let Some(text) = add_text {
+                new_data.annotations.push(Annotation::Note { text });
+            }
+            if let Err(e) = self.collection.update_data(idx, new_data) {
+                self.overlay.push_toast(format!("Annotation error: {e}"));
+            }
+        }
+    }
+
     // ── Filter sidebar ──────────────────────────────────────────────────────────
 
     fn render_filter_sidebar(&mut self, ctx: &egui::Context) {
@@ -993,6 +1127,23 @@ impl eframe::App for GalerieApp {
 
                 // Right-aligned controls
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.collection.is_empty() {
+                        let ann_count = self.collection.entries[self.viewer.focused_index()]
+                            .data.annotations.len();
+                        let ann_label = if ann_count > 0 {
+                            format!("✎ {ann_count}")
+                        } else {
+                            "✎".to_owned()
+                        };
+                        let btn = egui::Button::new(egui::RichText::new(ann_label).size(12.0))
+                            .selected(self.app_state.show_annotations);
+                        if ui.add(btn).on_hover_text("Toggle annotations (N)").clicked() {
+                            self.app_state.show_annotations = !self.app_state.show_annotations;
+                            if self.app_state.show_annotations {
+                                self.annotation_focus_pending = true;
+                            }
+                        }
+                    }
                     if matches!(&self.viewer, ViewerState::Single(_)) {
                         let btn = egui::Button::new(
                             egui::RichText::new("Hist").size(12.0),
@@ -1006,8 +1157,11 @@ impl eframe::App for GalerieApp {
             });
         });
 
-        // 8. Filter sidebar (single mode; must precede CentralPanel)
+        // 8. Filter sidebar (must precede CentralPanel)
         self.render_filter_sidebar(ctx);
+
+        // 8b. Annotations panel (floating window)
+        self.render_annotations_panel(ctx);
 
         // 9. Main content
         let bg = self.bg_color();

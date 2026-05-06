@@ -214,6 +214,12 @@ key = "Num1"
 modifiers = []
 action = "ZoomSingleToOne"
 args = {}
+
+[[keybindings]]
+key = "N"
+modifiers = []
+action = "ToggleAnnotations"
+args = {}
 "#;
     #[derive(Deserialize)]
     struct Wrapper {
