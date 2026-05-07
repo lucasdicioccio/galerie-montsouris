@@ -63,6 +63,9 @@ pub enum Filter {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         b: Vec<[f32; 2]>,
     },
+    /// Reference to a named preset stored in a galerie file.
+    /// Expanded to the preset's filter stack at render time; never passed to `apply`.
+    Preset { name: String },
 }
 
 impl Filter {
@@ -134,6 +137,9 @@ impl Filter {
     }
 
     fn same_kind(&self, other: &Filter) -> bool {
+        if matches!(self, Filter::Preset { .. }) || matches!(other, Filter::Preset { .. }) {
+            return false;
+        }
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 
@@ -156,6 +162,7 @@ impl Filter {
             Filter::Sharpen { amount } => apply_sharpen(img, *amount),
             Filter::MicroContrast { amount } => apply_micro_contrast(img, *amount),
             Filter::Curves { r, g, b } => apply_curves(img, r, g, b),
+            Filter::Preset { .. } => unreachable!("Preset must be resolved before apply"),
         }
     }
 }

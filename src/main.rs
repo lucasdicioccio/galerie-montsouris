@@ -164,6 +164,7 @@ fn run_init_gallery(dest: &Path, collection: &gallery::PhotoCollection) -> Resul
         background_color: None,
         pre_filters: vec![],
         post_filters: vec![],
+        presets: vec![],
     };
     gallery::save_gallery_file(dest, &gallery)?;
     eprintln!("Initialized gallery {} ({} photos)", dest.display(), gallery.photos.len());
@@ -219,6 +220,7 @@ fn main() -> Result<()> {
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],
+            presets: vec![],
         };
         gallery::save_gallery_file(dest, &gallery)?;
         log::info!("Saved gallery to {dest:?} ({} photos)", gallery.photos.len());

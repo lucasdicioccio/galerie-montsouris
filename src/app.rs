@@ -7,7 +7,7 @@ use crate::actions::{
 use crate::config::{Config, KeyBindingMap, ModifierSet};
 use crate::curve_editor::CurveEditor;
 use crate::filters::{Filter, RotateFill};
-use crate::gallery::{BackgroundColor, EditGallery, PhotoCollection};
+use crate::gallery::{BackgroundColor, EditGallery, FilterPreset, PhotoCollection};
 use crate::image_cache::{ImageCache, ImageHistogram, LoadState};
 use crate::overlay::{fit_rect, OverlayState};
 use crate::viewer::ViewerState;
@@ -45,6 +45,17 @@ pub struct GalerieApp {
     gallery_pre_accordion_open: HashSet<usize>,
     /// Same for the gallery post-filter stack.
     gallery_post_accordion_open: HashSet<usize>,
+    /// Combined preset pool from all loaded galerie files, with source tags for save-back.
+    presets: Vec<(FilterPreset, PresetSource)>,
+    /// Pending name text in the "Save from stack" preset form.
+    preset_save_name: String,
+}
+
+/// Identifies which galerie file owns a preset, so edits can be saved back.
+#[derive(Clone)]
+enum PresetSource {
+    Collection(std::path::PathBuf),
+    EditGallery(usize),
 }
 
 impl GalerieApp {
@@ -77,6 +88,20 @@ impl GalerieApp {
             cols.max(1)
         };
         let n = collection.len();
+
+        // Build the combined preset pool: collection galerie files first, then edit galleries.
+        let mut presets: Vec<(FilterPreset, PresetSource)> = collection
+            .all_presets()
+            .map(|(p, path)| (p.clone(), PresetSource::Collection(path.to_path_buf())))
+            .collect();
+        for (idx, eg) in edit_galleries.iter().enumerate() {
+            for p in &eg.presets {
+                if !presets.iter().any(|(ep, _)| ep.name == p.name) {
+                    presets.push((p.clone(), PresetSource::EditGallery(idx)));
+                }
+            }
+        }
+
         Self {
             config,
             keybindings,
@@ -100,6 +125,8 @@ impl GalerieApp {
             filter_accordion_open: HashSet::new(),
             gallery_pre_accordion_open: HashSet::new(),
             gallery_post_accordion_open: HashSet::new(),
+            presets,
+            preset_save_name: String::new(),
         }
     }
 
@@ -434,20 +461,58 @@ impl GalerieApp {
         }
     }
 
-    /// Compose the effective filter stack for photo `idx`:
-    /// gallery pre-filters → per-photo filters → gallery post-filters.
+    /// Compose the effective filter stack for photo at display index:
+    /// gallery pre-filters → per-photo stack (with Preset refs expanded) → gallery post-filters.
     fn effective_filters(&self, display_idx: usize) -> Vec<Filter> {
-        let photo = &self.collection.entries[self.ci(display_idx)].data.filters;
-        match self.collection.galerie_filters() {
-            None => photo.clone(),
-            Some((pre, post)) => {
-                let mut v = Vec::with_capacity(pre.len() + photo.len() + post.len());
-                v.extend_from_slice(&pre);
-                v.extend_from_slice(photo);
-                v.extend_from_slice(&post);
-                v
+        let data = &self.collection.entries[self.ci(display_idx)].data;
+        let gal = self.collection.galerie_filters();
+        let (pre, post) = gal.as_ref()
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+            .unwrap_or((&[], &[]));
+
+        let mut out = Vec::new();
+        out.extend_from_slice(pre);
+        for item in &data.filters {
+            match item {
+                Filter::Preset { name } => {
+                    if let Some((p, _)) = self.presets.iter().find(|(p, _)| p.name == *name) {
+                        out.extend(p.filters.iter().cloned());
+                    }
+                    // unknown preset name → silently skip
+                }
+                f => out.push(f.clone()),
             }
         }
+        out.extend_from_slice(post);
+        out
+    }
+
+    /// Invalidate cache for every photo whose stack contains a reference to `preset_name`.
+    fn invalidate_preset_dependents(&mut self, preset_name: &str) {
+        for i in 0..self.collection.entries.len() {
+            if self.collection.entries[i].data.filters.iter()
+                .any(|f| matches!(f, Filter::Preset { name } if name == preset_name))
+            {
+                self.cache.invalidate(i);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    /// Rebuild the preset pool from all current galerie sources.
+    fn rebuild_presets(&mut self) {
+        let mut presets: Vec<(FilterPreset, PresetSource)> = self.collection
+            .all_presets()
+            .map(|(p, path)| (p.clone(), PresetSource::Collection(path.to_path_buf())))
+            .collect();
+        for (idx, eg) in self.edit_galleries.iter().enumerate() {
+            for p in &eg.presets {
+                if !presets.iter().any(|(ep, _)| ep.name == p.name) {
+                    presets.push((p.clone(), PresetSource::EditGallery(idx)));
+                }
+            }
+        }
+        self.presets = presets;
     }
 
     fn prefetch_visible(&mut self, ctx: &egui::Context) {
@@ -922,17 +987,24 @@ impl GalerieApp {
         let idx = if is_single { Some(self.viewer.focused_index()) } else { None };
         let ci = idx.map(|di| self.ci(di));
         let photo_histogram: Option<ImageHistogram> = ci.and_then(|i| self.cache.get_histogram(i).cloned());
-        let mut new_filters = ci
+        let mut photo_stack = ci
             .map(|i| self.collection.entries[i].data.filters.clone())
             .unwrap_or_default();
+        let presets_snap: Vec<(FilterPreset, PresetSource)> = self.presets.clone();
         let mut photo_changed = false;
         let mut photo_toggle_req: Option<(usize, bool)> = None;
         let mut photo_to_remove: Option<usize> = None;
         let mut photo_to_add: Option<Filter> = None;
+        // Preset-specific intents
+        let mut preset_inline_changed: Option<(usize, Vec<Filter>)> = None; // (presets_snap idx, new filters)
+        let mut preset_insert: Option<usize> = None;   // insert presets_snap[i] into photo stack
+        let mut preset_lib_delete: Option<usize> = None;
+        let mut save_stack_as_preset = false;
 
         let acc = self.filter_accordion_open.clone();
         let acc_pre = self.gallery_pre_accordion_open.clone();
         let acc_post = self.gallery_post_accordion_open.clone();
+        let mut preset_save_name = self.preset_save_name.clone();
 
         egui::SidePanel::right("filter_sidebar")
             .resizable(true)
@@ -990,28 +1062,76 @@ impl GalerieApp {
                         if is_single {
                             ui.strong("Photo filters");
                             ui.add_space(2.0);
-                            if new_filters.is_empty() {
+                            if photo_stack.is_empty() {
                                 ui.label(egui::RichText::new("(none)").color(egui::Color32::GRAY).italics());
                             }
-                            for (i, filter) in new_filters.iter_mut().enumerate() {
-                                let kind = filter_kind_name(filter);
+                            for (i, filter) in photo_stack.iter_mut().enumerate() {
                                 let is_open = acc.contains(&i);
-                                let has_params = filter_has_params(filter);
-                                ui.horizontal(|ui| {
-                                    if has_params {
-                                        if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
-                                            photo_toggle_req = Some((i, !is_open));
+                                match filter {
+                                    Filter::Preset { name } => {
+                                        let preset_snap_idx = presets_snap.iter().position(|(p, _)| p.name == *name);
+                                        ui.horizontal(|ui| {
+                                            if preset_snap_idx.is_some() {
+                                                if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
+                                                    photo_toggle_req = Some((i, !is_open));
+                                                }
+                                            } else {
+                                                ui.add_space(18.0);
+                                            }
+                                            ui.strong(format!("Preset: {name}"));
+                                            if preset_snap_idx.is_none() {
+                                                ui.label(egui::RichText::new("(missing)").color(egui::Color32::RED).small());
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("×").on_hover_text("Remove from stack").clicked() {
+                                                    photo_to_remove = Some(i);
+                                                }
+                                            });
+                                        });
+                                        if is_open {
+                                            if let Some(psi) = preset_snap_idx {
+                                                let (preset, _) = &presets_snap[psi];
+                                                let mut sub_filters = preset.filters.clone();
+                                                let mut sub_changed = false;
+                                                ui.indent(egui::Id::new(("preset_inline", i)), |ui| {
+                                                    for (j, sub) in sub_filters.iter_mut().enumerate() {
+                                                        let sub_kind = filter_kind_name(sub);
+                                                        ui.label(egui::RichText::new(&sub_kind).strong().small());
+                                                        if filter_has_params(sub) {
+                                                            if render_filter_params(ui, sub, photo_histogram.as_ref()) {
+                                                                sub_changed = true;
+                                                            }
+                                                        }
+                                                        let _ = j;
+                                                        ui.add_space(2.0);
+                                                    }
+                                                });
+                                                if sub_changed {
+                                                    preset_inline_changed = Some((psi, sub_filters));
+                                                }
+                                            }
                                         }
-                                    } else { ui.add_space(18.0); }
-                                    ui.strong(kind);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("×").on_hover_text("Remove").clicked() { photo_to_remove = Some(i); }
-                                    });
-                                });
-                                if is_open && has_params {
-                                    ui.indent(egui::Id::new(("fp", i)), |ui| {
-                                        if render_filter_params(ui, filter, photo_histogram.as_ref()) { photo_changed = true; }
-                                    });
+                                    }
+                                    physical => {
+                                        let kind = filter_kind_name(physical);
+                                        let has_params = filter_has_params(physical);
+                                        ui.horizontal(|ui| {
+                                            if has_params {
+                                                if ui.small_button(if is_open { "▼" } else { "▶" }).clicked() {
+                                                    photo_toggle_req = Some((i, !is_open));
+                                                }
+                                            } else { ui.add_space(18.0); }
+                                            ui.strong(kind);
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("×").on_hover_text("Remove").clicked() { photo_to_remove = Some(i); }
+                                            });
+                                        });
+                                        if is_open && has_params {
+                                            ui.indent(egui::Id::new(("fp", i)), |ui| {
+                                                if render_filter_params(ui, physical, photo_histogram.as_ref()) { photo_changed = true; }
+                                            });
+                                        }
+                                    }
                                 }
                                 ui.add_space(2.0);
                             }
@@ -1019,6 +1139,32 @@ impl GalerieApp {
                             ui.horizontal_wrapped(|ui| {
                                 for (label, default) in filter_add_list() {
                                     if ui.small_button(label).clicked() { photo_to_add = Some(default); }
+                                }
+                            });
+
+                            // ── Presets library ─────────────────────────────────
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(2.0);
+                            ui.strong("Presets");
+                            if presets_snap.is_empty() {
+                                ui.label(egui::RichText::new("(none saved)").color(egui::Color32::GRAY).italics());
+                            }
+                            for (pi, (preset, _)) in presets_snap.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Insert").clicked() { preset_insert = Some(pi); }
+                                    ui.label(&preset.name);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Delete preset").clicked() { preset_lib_delete = Some(pi); }
+                                    });
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut preset_save_name)
+                                    .hint_text("Preset name")
+                                    .desired_width(120.0));
+                                if ui.small_button("Save from stack").clicked() && !preset_save_name.is_empty() {
+                                    save_stack_as_preset = true;
                                 }
                             });
                         } else if gal_path.is_none() {
@@ -1068,6 +1214,113 @@ impl GalerieApp {
                     });
             });
 
+        self.preset_save_name = preset_save_name;
+
+        // ── Apply preset mutations ──────────────────────────────────────────────
+
+        // Inline edit of a preset's physical filters → save back to source, invalidate
+        if let Some((psi, new_sub_filters)) = preset_inline_changed {
+            let (preset, source) = &self.presets[psi];
+            let preset_name = preset.name.clone();
+            let source = source.clone();
+            self.presets[psi].0.filters = new_sub_filters.clone();
+            match source {
+                PresetSource::Collection(ref path) => {
+                    let mut ps = self.collection.galerie_presets(path);
+                    if let Some(p) = ps.iter_mut().find(|p| p.name == preset_name) {
+                        p.filters = new_sub_filters;
+                    }
+                    if let Err(e) = self.collection.set_galerie_presets(path, ps) {
+                        self.overlay.push_toast(format!("Preset save error: {e}"));
+                    }
+                }
+                PresetSource::EditGallery(idx) => {
+                    if let Some(eg) = self.edit_galleries.get_mut(idx) {
+                        if let Some(p) = eg.presets.iter_mut().find(|p| p.name == preset_name) {
+                            p.filters = new_sub_filters;
+                        }
+                        if let Err(e) = eg.save() {
+                            self.overlay.push_toast(format!("Preset save error: {e}"));
+                        }
+                    }
+                }
+            }
+            self.invalidate_preset_dependents(&preset_name);
+        }
+
+        // Insert a preset reference into the current photo's stack
+        if let (Some(pi), Some(collection_idx)) = (preset_insert, ci) {
+            let name = self.presets[pi].0.name.clone();
+            let mut new_data = self.collection.entries[collection_idx].data.clone();
+            new_data.filters.push(Filter::Preset { name });
+            if let Err(e) = self.collection.update_data(collection_idx, new_data) {
+                self.overlay.push_toast(format!("Filter error: {e}"));
+            } else {
+                self.cache.invalidate(collection_idx);
+            }
+        }
+
+        // Save physical (non-Preset) filters from current photo stack as a new preset
+        if save_stack_as_preset {
+            let name = self.preset_save_name.clone();
+            if !name.is_empty() {
+                let physical_filters: Vec<Filter> = photo_stack.iter()
+                    .filter(|f| !matches!(f, Filter::Preset { .. }))
+                    .cloned()
+                    .collect();
+                let new_preset = FilterPreset { name: name.clone(), filters: physical_filters };
+                // Target: first Collection galerie, or first EditGallery
+                let saved = if let Some(path) = &gal_path {
+                    let path = path.clone();
+                    let mut presets = self.collection.galerie_presets(&path);
+                    presets.retain(|p| p.name != name);
+                    presets.push(new_preset.clone());
+                    match self.collection.set_galerie_presets(&path, presets) {
+                        Ok(()) => { self.presets.retain(|(p, _)| p.name != name); self.presets.push((new_preset, PresetSource::Collection(path))); true }
+                        Err(e) => { self.overlay.push_toast(format!("Preset save error: {e}")); false }
+                    }
+                } else if let Some(eg) = self.edit_galleries.first_mut() {
+                    eg.presets.retain(|p| p.name != name);
+                    eg.presets.push(new_preset.clone());
+                    let eg_idx = 0;
+                    match eg.save() {
+                        Ok(()) => { self.presets.retain(|(p, _)| p.name != name); self.presets.push((new_preset, PresetSource::EditGallery(eg_idx))); true }
+                        Err(e) => { self.overlay.push_toast(format!("Preset save error: {e}")); false }
+                    }
+                } else {
+                    self.overlay.push_toast("No galerie file loaded — cannot save preset.".to_string());
+                    false
+                };
+                if saved { self.preset_save_name.clear(); self.invalidate_preset_dependents(&name); }
+            }
+        }
+
+        // Delete a preset from its source galerie
+        if let Some(pi) = preset_lib_delete {
+            let (preset, source) = self.presets.remove(pi);
+            let preset_name = preset.name.clone();
+            match source {
+                PresetSource::Collection(ref path) => {
+                    let updated: Vec<_> = self.collection.galerie_presets(path)
+                        .into_iter()
+                        .filter(|p| p.name != preset_name)
+                        .collect();
+                    if let Err(e) = self.collection.set_galerie_presets(path, updated) {
+                        self.overlay.push_toast(format!("Preset delete error: {e}"));
+                    }
+                }
+                PresetSource::EditGallery(idx) => {
+                    if let Some(eg) = self.edit_galleries.get_mut(idx) {
+                        eg.presets.retain(|p| p.name != preset_name);
+                        if let Err(e) = eg.save() {
+                            self.overlay.push_toast(format!("Preset delete error: {e}"));
+                        }
+                    }
+                }
+            }
+            self.invalidate_preset_dependents(&preset_name);
+        }
+
         // ── Apply gallery-filter changes ────────────────────────────────────────
         if let Some((tag, i, open)) = gal_toggle_req {
             let set = if tag == "pre" { &mut self.gallery_pre_accordion_open } else { &mut self.gallery_post_accordion_open };
@@ -1108,19 +1361,19 @@ impl GalerieApp {
             if open { self.filter_accordion_open.insert(i); } else { self.filter_accordion_open.remove(&i); }
         }
         if let Some(i) = photo_to_remove {
-            new_filters.remove(i);
+            photo_stack.remove(i);
             self.filter_accordion_open = accordion_after_remove(&self.filter_accordion_open, i);
             photo_changed = true;
         }
         if let Some(f) = photo_to_add {
-            self.filter_accordion_open.insert(new_filters.len());
-            new_filters.push(f);
+            self.filter_accordion_open.insert(photo_stack.len());
+            photo_stack.push(f);
             photo_changed = true;
         }
         if photo_changed {
             if let Some(collection_idx) = ci {
                 let mut new_data = self.collection.entries[collection_idx].data.clone();
-                new_data.filters = new_filters;
+                new_data.filters = photo_stack;
                 if let Err(e) = self.collection.update_data(collection_idx, new_data) {
                     self.overlay.push_toast(format!("Filter error: {e}"));
                 } else {
@@ -1310,25 +1563,26 @@ fn compose_filters(photo: &[Filter], gallery: Option<&(Vec<Filter>, Vec<Filter>)
     }
 }
 
-fn filter_kind_name(filter: &Filter) -> &'static str {
+fn filter_kind_name(filter: &Filter) -> String {
     match filter {
-        Filter::Rotate { .. }       => "Rotate",
-        Filter::FlipHorizontal      => "Flip H",
-        Filter::FlipVertical        => "Flip V",
-        Filter::Crop { .. }         => "Crop",
-        Filter::Scale { .. }        => "Scale",
-        Filter::Exposure { .. }     => "Exposure",
-        Filter::Contrast { .. }     => "Contrast",
-        Filter::CapSize { .. }      => "Cap Size",
-        Filter::Border { .. }       => "Border",
-        Filter::Sharpen { .. }      => "Sharpen",
-        Filter::MicroContrast { .. } => "Clarity",
-        Filter::Curves { .. }       => "Curves",
+        Filter::Rotate { .. }        => "Rotate".to_string(),
+        Filter::FlipHorizontal       => "Flip H".to_string(),
+        Filter::FlipVertical         => "Flip V".to_string(),
+        Filter::Crop { .. }          => "Crop".to_string(),
+        Filter::Scale { .. }         => "Scale".to_string(),
+        Filter::Exposure { .. }      => "Exposure".to_string(),
+        Filter::Contrast { .. }      => "Contrast".to_string(),
+        Filter::CapSize { .. }       => "Cap Size".to_string(),
+        Filter::Border { .. }        => "Border".to_string(),
+        Filter::Sharpen { .. }       => "Sharpen".to_string(),
+        Filter::MicroContrast { .. } => "Clarity".to_string(),
+        Filter::Curves { .. }        => "Curves".to_string(),
+        Filter::Preset { name }      => format!("Preset: {name}"),
     }
 }
 
 fn filter_has_params(filter: &Filter) -> bool {
-    !matches!(filter, Filter::FlipHorizontal | Filter::FlipVertical)
+    !matches!(filter, Filter::FlipHorizontal | Filter::FlipVertical | Filter::Preset { .. })
 }
 
 /// Default instances for the "Add filter" buttons, in display order.
@@ -1501,6 +1755,7 @@ fn render_filter_params(ui: &mut egui::Ui, filter: &mut Filter, histogram: Optio
             changed |= ui.add(w).changed();
             changed
         }
+        Filter::Preset { .. } => unreachable!("Preset must be expanded before render_filter_params"),
     }
 }
 

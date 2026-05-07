@@ -536,6 +536,7 @@ fn filter_description(filters: &[Filter]) -> String {
             Filter::Curves { r, g, b } => {
                 format!("Curves ({}/{}/{} pts)", r.len(), g.len(), b.len())
             }
+            Filter::Preset { name } => format!("Preset: {name}"),
         };
         parts.push(s);
     }

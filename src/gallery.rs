@@ -9,6 +9,15 @@ use crate::filters::Filter;
 
 const SUPPORTED_EXT: &[&str] = &["jpg", "jpeg", "png", "webp", "tif", "tiff"];
 
+/// A named filter stack stored in a galerie file and referenceable from any photo stack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilterPreset {
+    pub name: String,
+    /// Physical filters only — no nested Preset variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<Filter>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
 pub enum Annotation {
@@ -97,6 +106,9 @@ pub struct GalleryFile {
     /// Filters applied to every photo *after* its own per-photo filters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_filters: Vec<Filter>,
+    /// Named preset filter stacks defined in this galerie file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presets: Vec<FilterPreset>,
 }
 
 /// What a single CLI argument resolves to.
@@ -114,6 +126,8 @@ pub struct EditGallery {
     member_paths: HashSet<PathBuf>, // canonical absolute paths for O(1) lookup
     /// Background color setting from the galerie file; preserved on save.
     pub background_color: Option<BackgroundColor>,
+    /// Preset definitions stored in this galerie file.
+    pub presets: Vec<FilterPreset>,
 }
 
 impl EditGallery {
@@ -124,7 +138,7 @@ impl EditGallery {
             .and_then(|s| s.to_str())
             .unwrap_or("gallery")
             .to_owned();
-        let (entries, member_paths, background_color) = if path.exists() {
+        let (entries, member_paths, background_color, presets) = if path.exists() {
             let gf = load_gallery_file(&path)?;
             let member_paths = gf.photos
                 .iter()
@@ -134,11 +148,11 @@ impl EditGallery {
                 if let Ok(p) = e.path.canonicalize() { e.path = p; }
                 e
             }).collect();
-            (entries, member_paths, gf.background_color)
+            (entries, member_paths, gf.background_color, gf.presets)
         } else {
-            (Vec::new(), HashSet::new(), None)
+            (Vec::new(), HashSet::new(), None, Vec::new())
         };
-        Ok(Self { path, name, entries, member_paths, background_color })
+        Ok(Self { path, name, entries, member_paths, background_color, presets })
     }
 
     pub fn contains(&self, path: &Path) -> bool {
@@ -164,16 +178,25 @@ impl EditGallery {
         }
     }
 
-    /// Write the current member set to the gallery file.
+    /// Write the current member set (and presets) to the gallery file.
+    /// Pre/post filters are read from disk first to avoid clobbering them
+    /// (they are managed by PhotoCollection, not EditGallery).
     pub fn save(&self) -> Result<()> {
+        let (pre_filters, post_filters) = if self.path.exists() {
+            let gf = load_gallery_file(&self.path)?;
+            (gf.pre_filters, gf.post_filters)
+        } else {
+            (vec![], vec![])
+        };
         save_gallery_file(
             &self.path,
             &GalleryFile {
                 name: self.name.clone(),
                 photos: self.entries.clone(),
                 background_color: self.background_color,
-                pre_filters: vec![],
-                post_filters: vec![],
+                pre_filters,
+                post_filters,
+                presets: self.presets.clone(),
             },
         )
     }
@@ -372,6 +395,32 @@ impl PhotoCollection {
         }
         Ok(())
     }
+
+    /// Presets for a specific galerie file (cloned list for editing).
+    pub fn galerie_presets(&self, path: &Path) -> Vec<FilterPreset> {
+        self.galerie_files.get(path)
+            .map(|gf| gf.presets.clone())
+            .unwrap_or_default()
+    }
+
+    /// All presets from all loaded galerie files.
+    pub fn all_presets(&self) -> impl Iterator<Item = (&FilterPreset, &Path)> {
+        self.galerie_files.iter()
+            .flat_map(|(path, gf)| gf.presets.iter().map(move |p| (p, path.as_path())))
+    }
+
+    /// Update the preset list for the given galerie file and flush to disk.
+    pub fn set_galerie_presets(
+        &mut self,
+        galerie_path: &Path,
+        presets: Vec<FilterPreset>,
+    ) -> Result<()> {
+        if let Some(gf) = self.galerie_files.get_mut(galerie_path) {
+            gf.presets = presets;
+            save_gallery_file(galerie_path, gf)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------- hashing ----------
@@ -412,7 +461,7 @@ pub fn load_gallery_file(path: &Path) -> Result<GalleryFile> {
     let photos = legacy.photos.into_iter().map(|p| {
         GalleryEntry { path: p, hash: String::new(), filters: vec![], rating: None, annotations: vec![] }
     }).collect();
-    Ok(GalleryFile { name: legacy.name, photos, background_color: None, pre_filters: vec![], post_filters: vec![] })
+    Ok(GalleryFile { name: legacy.name, photos, background_color: None, pre_filters: vec![], post_filters: vec![], presets: vec![] })
 }
 
 pub fn save_gallery_file(path: &Path, gallery: &GalleryFile) -> Result<()> {
@@ -545,6 +594,7 @@ mod tests {
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],
+            presets: vec![],
         };
         let gal_path = tmp.path().join("test.galerie");
         save_gallery_file(&gal_path, &gal).unwrap();
@@ -584,6 +634,7 @@ mod tests {
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],
+            presets: vec![],
         };
         let gal_path = tmp.path().join("g.galerie");
         save_gallery_file(&gal_path, &gal).unwrap();
@@ -618,6 +669,7 @@ mod tests {
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],
+            presets: vec![],
         };
         let gal_path = tmp.path().join("g.galerie");
         save_gallery_file(&gal_path, &gal).unwrap();
