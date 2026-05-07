@@ -77,6 +77,10 @@ pub struct GalleryEntry {
     pub hash: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<Filter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<Annotation>,
 }
 
 /// On-disk format for a `.galerie` named-gallery file.
@@ -153,6 +157,8 @@ impl EditGallery {
                 path: path.to_path_buf(),
                 hash: hash.to_string(),
                 filters: vec![],
+                rating: None,
+                annotations: vec![],
             });
             true
         }
@@ -177,48 +183,41 @@ impl EditGallery {
 
 pub struct PhotoCollection {
     pub entries:   Vec<PhotoEntry>,
-    sidecar_paths: HashMap<PathBuf, PathBuf>,
-    /// In-memory state for loaded galerie files; updated and flushed on filter changes.
+    /// In-memory state for loaded galerie files; updated and flushed on data changes.
     galerie_files: HashMap<PathBuf, GalleryFile>,
 }
 
 impl PhotoCollection {
-    /// Convenience: scan a list of directories (backward-compatible entry point).
+    /// Convenience: scan a list of directories.
     #[allow(dead_code)]
     pub fn scan(dirs: &[PathBuf]) -> Result<Self> {
         let args: Vec<InputArg> = dirs.iter().map(|d| InputArg::Directory(d.clone())).collect();
         Self::from_args(&args)
     }
 
+    /// Returns true if any galerie file is loaded (rating/annotation persistence is available).
+    #[allow(dead_code)]
+    pub fn has_galerie_source(&self) -> bool {
+        !self.galerie_files.is_empty()
+    }
+
     /// Load from a mixed list of directories and `.galerie` gallery files.
     pub fn from_args(args: &[InputArg]) -> Result<Self> {
         let mut col = Self {
             entries: Vec::new(),
-            sidecar_paths: HashMap::new(),
             galerie_files: HashMap::new(),
         };
-        let mut sidecar_cache: HashMap<PathBuf, HashMap<String, PhotoData>> = HashMap::new();
         for arg in args {
             match arg {
-                InputArg::Directory(dir)    => col.add_directory(dir, &mut sidecar_cache)?,
-                InputArg::GalleryFile(path) => col.add_from_gallery_file(path, &mut sidecar_cache)?,
+                InputArg::Directory(dir)    => col.add_directory(dir)?,
+                InputArg::GalleryFile(path) => col.add_from_gallery_file(path)?,
             }
         }
         Ok(col)
     }
 
-    fn add_directory(
-        &mut self,
-        dir: &PathBuf,
-        cache: &mut HashMap<PathBuf, HashMap<String, PhotoData>>,
-    ) -> Result<()> {
+    fn add_directory(&mut self, dir: &PathBuf) -> Result<()> {
         let dir = dir.canonicalize().with_context(|| format!("resolving {dir:?}"))?;
-        let sidecar_path = dir.join(".galerie.json");
-
-        if !cache.contains_key(&dir) {
-            let sidecar = load_sidecar(&sidecar_path, &dir).unwrap_or_default();
-            cache.insert(dir.clone(), sidecar);
-        }
 
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
             .with_context(|| format!("reading directory {dir:?}"))?
@@ -233,22 +232,16 @@ impl PhotoCollection {
                 Ok(h)  => h,
                 Err(e) => { log::warn!("Failed to hash {path:?}: {e}"); continue; }
             };
-            let data = cache.get(&dir).and_then(|s| s.get(&hash)).cloned().unwrap_or_default();
             let index = self.entries.len();
-            self.entries.push(PhotoEntry { index, path, hash, data, galerie_source: None });
+            self.entries.push(PhotoEntry { index, path, hash, data: PhotoData::default(), galerie_source: None });
         }
-        self.sidecar_paths.insert(dir, sidecar_path);
         Ok(())
     }
 
-    fn add_from_gallery_file(
-        &mut self,
-        path: &PathBuf,
-        cache: &mut HashMap<PathBuf, HashMap<String, PhotoData>>,
-    ) -> Result<()> {
+    fn add_from_gallery_file(&mut self, path: &PathBuf) -> Result<()> {
         let mut gallery = load_gallery_file(path)?;
         let galerie_abs = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let mut needs_save = false; // true if hashes were computed for legacy entries
+        let mut needs_save = false;
 
         for ge in &mut gallery.photos {
             let photo_path = match ge.path.canonicalize() {
@@ -258,17 +251,6 @@ impl PhotoCollection {
             if !photo_path.is_file() {
                 log::warn!("Gallery photo {photo_path:?} is not a file, skipping");
                 continue;
-            }
-            let dir = match photo_path.parent() {
-                Some(d) => d.to_path_buf(),
-                None    => { log::warn!("Gallery photo {photo_path:?} has no parent dir"); continue; }
-            };
-
-            if !cache.contains_key(&dir) {
-                let sp = dir.join(".galerie.json");
-                let sidecar = load_sidecar(&sp, &dir).unwrap_or_default();
-                cache.insert(dir.clone(), sidecar);
-                self.sidecar_paths.entry(dir.clone()).or_insert_with(|| dir.join(".galerie.json"));
             }
 
             // Use stored hash if valid; otherwise compute it (legacy entry).
@@ -281,12 +263,10 @@ impl PhotoCollection {
                 }
             };
 
-            // Rating and annotations come from the directory sidecar (shared); filters are galerie-specific.
-            let sidecar_entry = cache.get(&dir).and_then(|s| s.get(&hash)).cloned();
             let data = PhotoData {
-                rating: sidecar_entry.as_ref().and_then(|d| d.rating),
+                rating: ge.rating,
                 filters: ge.filters.clone(),
-                annotations: sidecar_entry.map(|d| d.annotations).unwrap_or_default(),
+                annotations: ge.annotations.clone(),
             };
 
             let index = self.entries.len();
@@ -299,7 +279,6 @@ impl PhotoCollection {
             });
         }
 
-        // Auto-save migrated galerie file so hashes are persisted for next open.
         if needs_save {
             if let Err(e) = save_gallery_file(path, &gallery) {
                 log::warn!("Could not save migrated galerie file {path:?}: {e}");
@@ -310,18 +289,12 @@ impl PhotoCollection {
         Ok(())
     }
 
+    /// Update in-memory data and persist to the galerie file if this photo has one.
+    /// Photos loaded from a directory (no galerie source) are updated in memory only.
     pub fn update_data(&mut self, index: usize, data: PhotoData) -> Result<()> {
-        let entry = &mut self.entries[index];
-        entry.data = data.clone();
+        self.entries[index].data = data.clone();
+        let galerie_source = self.entries[index].galerie_source.clone();
 
-        let dir = entry
-            .path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("photo has no parent dir"))?
-            .to_path_buf();
-        let galerie_source = entry.galerie_source.clone();
-
-        // If this photo came from a galerie file, persist its filters there.
         if let Some(ref galerie_path) = galerie_source {
             if let Some(gf) = self.galerie_files.get_mut(galerie_path) {
                 let entry_path = self.entries[index].path.clone();
@@ -330,36 +303,15 @@ impl PhotoCollection {
                     let ge_canon = ge.path.canonicalize().unwrap_or_else(|_| ge.path.clone());
                     if ge_canon == entry_path || ge.hash == entry_hash {
                         ge.filters = data.filters.clone();
+                        ge.rating = data.rating;
+                        ge.annotations = data.annotations.clone();
                         break;
                     }
                 }
                 save_gallery_file(galerie_path, gf)?;
             }
         }
-
-        // Persist to the directory sidecar.
-        // For galerie-sourced entries, only the rating goes to the sidecar (filters live in the
-        // galerie file), so we don't overwrite any dir-scan filter data for the same photo.
-        let sidecar_path = self
-            .sidecar_paths
-            .get(&dir)
-            .cloned()
-            .unwrap_or_else(|| dir.join(".galerie.json"));
-
-        let mut map: HashMap<String, PhotoData> = HashMap::new();
-        for e in &self.entries {
-            if e.path.parent().map(|p| p == dir).unwrap_or(false) {
-                let sidecar_data = if e.galerie_source.is_some() {
-                    PhotoData { rating: e.data.rating, filters: vec![], annotations: e.data.annotations.clone() }
-                } else {
-                    e.data.clone()
-                };
-                if sidecar_data.rating.is_some() || !sidecar_data.filters.is_empty() || !sidecar_data.annotations.is_empty() {
-                    map.insert(e.hash.clone(), sidecar_data);
-                }
-            }
-        }
-        save_sidecar(&sidecar_path, &map)
+        Ok(())
     }
 
     pub fn len(&self) -> usize { self.entries.len() }
@@ -458,7 +410,7 @@ pub fn load_gallery_file(path: &Path) -> Result<GalleryFile> {
     let legacy: Legacy = serde_json::from_str(&text)
         .with_context(|| format!("parsing gallery file {path:?}"))?;
     let photos = legacy.photos.into_iter().map(|p| {
-        GalleryEntry { path: p, hash: String::new(), filters: vec![] }
+        GalleryEntry { path: p, hash: String::new(), filters: vec![], rating: None, annotations: vec![] }
     }).collect();
     Ok(GalleryFile { name: legacy.name, photos, background_color: None, pre_filters: vec![], post_filters: vec![] })
 }
@@ -468,8 +420,6 @@ pub fn save_gallery_file(path: &Path, gallery: &GalleryFile) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing gallery file {path:?}"))
 }
 
-// ---------- sidecar I/O ----------
-
 fn is_supported_image(path: &Path) -> bool {
     path.is_file()
         && path
@@ -477,59 +427,6 @@ fn is_supported_image(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| SUPPORTED_EXT.contains(&e.to_lowercase().as_str()))
             .unwrap_or(false)
-}
-
-fn load_sidecar(path: &Path, dir: &Path) -> Result<HashMap<String, PhotoData>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading sidecar {path:?}"))?;
-    let raw: HashMap<String, PhotoData> = serde_json::from_str(&text)
-        .with_context(|| format!("parsing sidecar {path:?}"))?;
-    if raw.keys().all(|k| is_hash_key(k)) {
-        return Ok(raw);
-    }
-    let (migrated, was_changed) = migrate_sidecar_keys(dir, raw);
-    if was_changed {
-        if let Err(e) = save_sidecar(path, &migrated) {
-            log::warn!("Could not write migrated sidecar {path:?}: {e}");
-        }
-    }
-    Ok(migrated)
-}
-
-fn migrate_sidecar_keys(
-    dir: &Path,
-    raw: HashMap<String, PhotoData>,
-) -> (HashMap<String, PhotoData>, bool) {
-    let mut result = HashMap::new();
-    let mut was_changed = false;
-    for (key, data) in raw {
-        if is_hash_key(&key) {
-            result.insert(key, data);
-        } else {
-            let file_path = dir.join(&key);
-            if file_path.exists() {
-                match hash_photo_file(&file_path) {
-                    Ok(hash) => { result.insert(hash, data); was_changed = true; }
-                    Err(e)   => {
-                        log::warn!("Hash failed for {file_path:?} during migration: {e}");
-                        result.insert(key, data);
-                    }
-                }
-            } else {
-                log::debug!("Dropping orphan sidecar entry {:?} (file not found)", key);
-                was_changed = true;
-            }
-        }
-    }
-    (result, was_changed)
-}
-
-fn save_sidecar(path: &Path, map: &HashMap<String, PhotoData>) -> Result<()> {
-    let text = serde_json::to_string_pretty(map)?;
-    std::fs::write(path, text).with_context(|| format!("writing sidecar {path:?}"))
 }
 
 #[cfg(test)]
@@ -589,14 +486,16 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_round_trip() {
+    fn dir_scan_no_persistence() {
+        // Without a galerie file, update_data is in-memory only.
         let tmp = TempDir::new().unwrap();
         make_temp_jpeg(tmp.path(), "a.jpg");
         let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
         assert_eq!(col.entries[0].data.rating, None);
         col.update_data(0, PhotoData { rating: Some(4), ..Default::default() }).unwrap();
+        assert_eq!(col.entries[0].data.rating, Some(4)); // in-memory OK
         let col2 = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(col2.entries[0].data.rating, Some(4));
+        assert_eq!(col2.entries[0].data.rating, None); // not persisted
     }
 
     #[test]
@@ -631,31 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_preserves_rating() {
-        let tmp = TempDir::new().unwrap();
-        make_temp_jpeg(tmp.path(), "original.jpg");
-        let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        col.update_data(0, PhotoData { rating: Some(5), ..Default::default() }).unwrap();
-        std::fs::rename(tmp.path().join("original.jpg"), tmp.path().join("renamed.jpg")).unwrap();
-        let col2 = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(col2.entries[0].data.rating, Some(5));
-    }
-
-    #[test]
-    fn sidecar_migration_on_reload() {
-        let tmp = TempDir::new().unwrap();
-        make_temp_jpeg(tmp.path(), "a.jpg");
-        std::fs::write(tmp.path().join(".galerie.json"), r#"{"a.jpg": {"rating": 3}}"#).unwrap();
-        let col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(col.entries[0].data.rating, Some(3));
-        let on_disk = std::fs::read_to_string(tmp.path().join(".galerie.json")).unwrap();
-        let map: HashMap<String, PhotoData> = serde_json::from_str(&on_disk).unwrap();
-        assert_eq!(map.len(), 1);
-        let key = map.keys().next().unwrap();
-        assert!(is_hash_key(key), "expected hash key, got {key:?}");
-    }
-
-    #[test]
     fn gallery_file_round_trip() {
         let tmp = TempDir::new().unwrap();
         make_temp_jpeg(tmp.path(), "a.jpg");
@@ -665,8 +539,8 @@ mod tests {
         let gal = GalleryFile {
             name: "test".to_owned(),
             photos: vec![
-                GalleryEntry { path: abs_a, hash: "a1b2c3d4e5f60718".to_string(), filters: vec![] },
-                GalleryEntry { path: abs_b, hash: "b2c3d4e5f6071829".to_string(), filters: vec![] },
+                GalleryEntry { path: abs_a, hash: "a1b2c3d4e5f60718".to_string(), filters: vec![], rating: Some(3), annotations: vec![] },
+                GalleryEntry { path: abs_b, hash: "b2c3d4e5f6071829".to_string(), filters: vec![], rating: None, annotations: vec![] },
             ],
             background_color: None,
             pre_filters: vec![],
@@ -678,6 +552,7 @@ mod tests {
         assert_eq!(gal2.name, "test");
         assert_eq!(gal2.photos.len(), 2);
         assert_eq!(gal2.photos[0].hash, "a1b2c3d4e5f60718");
+        assert_eq!(gal2.photos[0].rating, Some(3));
     }
 
     #[test]
@@ -697,25 +572,34 @@ mod tests {
     }
 
     #[test]
-    fn from_args_loads_gallery() {
+    fn galerie_rating_annotation_round_trip() {
+        // Rating and annotations persist in the galerie file and survive reload.
         let tmp = TempDir::new().unwrap();
         make_temp_jpeg(tmp.path(), "a.jpg");
         let abs_a = tmp.path().join("a.jpg").canonicalize().unwrap();
-        let mut col = PhotoCollection::scan(&[tmp.path().to_path_buf()]).unwrap();
-        col.update_data(0, PhotoData { rating: Some(2), ..Default::default() }).unwrap();
-        let hash_a = col.entries[0].hash.clone();
+        let hash_a = hash_photo_file(&abs_a).unwrap();
         let gal = GalleryFile {
             name: "g".to_owned(),
-            photos: vec![GalleryEntry { path: abs_a, hash: hash_a, filters: vec![] }],
+            photos: vec![GalleryEntry { path: abs_a, hash: hash_a, filters: vec![], rating: None, annotations: vec![] }],
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],
         };
         let gal_path = tmp.path().join("g.galerie");
         save_gallery_file(&gal_path, &gal).unwrap();
+
+        let mut col = PhotoCollection::from_args(&[InputArg::GalleryFile(gal_path.clone())]).unwrap();
+        col.update_data(0, PhotoData {
+            rating: Some(4),
+            annotations: vec![Annotation::Note { text: "lovely".to_owned() }],
+            ..Default::default()
+        }).unwrap();
+
         let col2 = PhotoCollection::from_args(&[InputArg::GalleryFile(gal_path)]).unwrap();
-        assert_eq!(col2.len(), 1);
-        assert_eq!(col2.entries[0].data.rating, Some(2));
+        assert_eq!(col2.entries[0].data.rating, Some(4));
+        assert_eq!(col2.entries[0].data.annotations.len(), 1);
+        let Annotation::Note { text } = &col2.entries[0].data.annotations[0];
+        assert_eq!(text, "lovely");
     }
 
     #[test]
@@ -730,7 +614,7 @@ mod tests {
         let filters = vec![Filter::Rotate { degrees: 90, center: None, fill: RotateFill::Transparent }];
         let gal = GalleryFile {
             name: "g".to_owned(),
-            photos: vec![GalleryEntry { path: abs_a.clone(), hash: hash_a.clone(), filters: filters.clone() }],
+            photos: vec![GalleryEntry { path: abs_a.clone(), hash: hash_a.clone(), filters: filters.clone(), rating: None, annotations: vec![] }],
             background_color: None,
             pre_filters: vec![],
             post_filters: vec![],

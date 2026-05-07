@@ -31,6 +31,10 @@ pub struct GalerieApp {
     last_tiling_cell_size: f32,
     /// Saved tiling `cols` so switching back from single mode restores the previous grid size.
     last_tiling_cols: usize,
+    /// Current annotation search query.
+    search_query: String,
+    /// Maps display index → collection index; rebuilt whenever `search_query` changes.
+    filtered_indices: Vec<usize>,
     /// Pending text for the annotation add-input box.
     annotation_input: String,
     /// Set to true when the annotation panel is opened — causes the text input to be focused.
@@ -72,6 +76,7 @@ impl GalerieApp {
             let cols = (config.general.tile_count as f64).sqrt().ceil() as usize;
             cols.max(1)
         };
+        let n = collection.len();
         Self {
             config,
             keybindings,
@@ -88,6 +93,8 @@ impl GalerieApp {
             gallery_selector_cursor: 0,
             last_tiling_cell_size: 200.0,
             last_tiling_cols: initial_cols,
+            search_query: String::new(),
+            filtered_indices: (0..n).collect(),
             annotation_input: String::new(),
             annotation_focus_pending: false,
             filter_accordion_open: HashSet::new(),
@@ -207,6 +214,8 @@ impl GalerieApp {
                                 script_tx: &self.script_tx,
                                 script_result_tx: self.script_result_tx.clone(),
                                 ctx: ctx.clone(),
+                                display_len: self.filtered_indices.len(),
+                                display_to_collection: &self.filtered_indices,
                             };
                             execute_action(&action, &mut cx);
                         }
@@ -236,6 +245,61 @@ impl GalerieApp {
         self.overlay.push_toast(format!("Background: {}", color.label()));
     }
 
+    /// Translate a display (viewer) index to a collection index.
+    #[inline]
+    fn ci(&self, display_idx: usize) -> usize {
+        self.filtered_indices[display_idx]
+    }
+
+    #[inline]
+    fn display_len(&self) -> usize {
+        self.filtered_indices.len()
+    }
+
+    /// Rebuild `filtered_indices` from the current `search_query` and clamp the viewer.
+    fn update_filter(&mut self) {
+        use crate::gallery::Annotation;
+        let query = self.search_query.trim().to_lowercase();
+
+        let old_ci = self.filtered_indices.get(self.viewer.focused_index()).copied();
+
+        if query.is_empty() {
+            self.filtered_indices = (0..self.collection.len()).collect();
+        } else {
+            let tokens: Vec<&str> = query.split_whitespace().collect();
+            self.filtered_indices = (0..self.collection.len())
+                .filter(|&i| {
+                    let anns = &self.collection.entries[i].data.annotations;
+                    tokens.iter().all(|token| {
+                        anns.iter().any(|ann| {
+                            let Annotation::Note { text } = ann;
+                            text.to_lowercase().contains(token)
+                        })
+                    })
+                })
+                .collect();
+        }
+
+        let new_len = self.filtered_indices.len();
+        if new_len == 0 { return; }
+
+        // Preserve the previously focused photo's position, or go to 0.
+        let new_di = old_ci
+            .and_then(|ci| self.filtered_indices.iter().position(|&x| x == ci))
+            .unwrap_or(0);
+
+        match &mut self.viewer {
+            crate::viewer::ViewerState::Tiling(s) => {
+                let tc = s.tile_count();
+                s.page = new_di / tc;
+                s.selected = new_di % tc;
+            }
+            crate::viewer::ViewerState::Single(s) => {
+                s.current_index = new_di;
+            }
+        }
+    }
+
     fn bg_color(&self) -> egui::Color32 {
         match self.app_state.background_color {
             BackgroundColor::Black => egui::Color32::from_gray(15),
@@ -247,12 +311,13 @@ impl GalerieApp {
     // ── Gallery editing helpers ──────────────────────────────────────────────────
 
     fn handle_gallery_t_press(&mut self) {
-        if self.edit_galleries.is_empty() || self.collection.is_empty() {
+        if self.edit_galleries.is_empty() || self.filtered_indices.is_empty() {
             return;
         }
         if self.edit_galleries.len() == 1 {
             // Direct toggle without selector
-            let idx = self.viewer.focused_index();
+            let di = self.viewer.focused_index();
+            let idx = self.ci(di);
             let path = self.collection.entries[idx].path.clone();
             let hash = self.collection.entries[idx].hash.clone();
             let added = self.edit_galleries[0].toggle(&path, &hash);
@@ -277,14 +342,15 @@ impl GalerieApp {
     }
 
     fn toggle_at_cursor(&mut self) {
-        if self.collection.is_empty() {
+        if self.filtered_indices.is_empty() {
             return;
         }
         let cursor = self.gallery_selector_cursor;
         if cursor >= self.edit_galleries.len() {
             return;
         }
-        let idx = self.viewer.focused_index();
+        let di = self.viewer.focused_index();
+        let idx = self.ci(di);
         let path = self.collection.entries[idx].path.clone();
         let hash = self.collection.entries[idx].hash.clone();
         self.edit_galleries[cursor].toggle(&path, &hash);
@@ -296,11 +362,11 @@ impl GalerieApp {
 
     /// Render the floating gallery-membership selector (when open).
     fn render_gallery_selector(&mut self, ctx: &egui::Context) {
-        if !self.gallery_selector_open || self.collection.is_empty() {
+        if !self.gallery_selector_open || self.filtered_indices.is_empty() {
             return;
         }
-        let focused_idx = self.viewer.focused_index();
-        let focused_path = self.collection.entries[focused_idx].path.clone();
+        let focused_ci = self.ci(self.viewer.focused_index());
+        let focused_path = self.collection.entries[focused_ci].path.clone();
         let filename = focused_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -360,7 +426,7 @@ impl GalerieApp {
         let elapsed = self.app_state.slideshow_last_at.elapsed();
         if elapsed >= interval {
             self.viewer
-                .navigate(crate::viewer::Direction::Next, 1, self.collection.len());
+                .navigate(crate::viewer::Direction::Next, 1, self.display_len());
             self.app_state.slideshow_last_at = std::time::Instant::now();
             ctx.request_repaint();
         } else {
@@ -370,8 +436,8 @@ impl GalerieApp {
 
     /// Compose the effective filter stack for photo `idx`:
     /// gallery pre-filters → per-photo filters → gallery post-filters.
-    fn effective_filters(&self, idx: usize) -> Vec<Filter> {
-        let photo = &self.collection.entries[idx].data.filters;
+    fn effective_filters(&self, display_idx: usize) -> Vec<Filter> {
+        let photo = &self.collection.entries[self.ci(display_idx)].data.filters;
         match self.collection.galerie_filters() {
             None => photo.clone(),
             Some((pre, post)) => {
@@ -385,7 +451,7 @@ impl GalerieApp {
     }
 
     fn prefetch_visible(&mut self, ctx: &egui::Context) {
-        let total = self.collection.len();
+        let total = self.display_len();
         let max_size = match &self.viewer {
             ViewerState::Single(_) => None,
             ViewerState::Tiling(_) => {
@@ -393,25 +459,27 @@ impl GalerieApp {
                 Some(phys.max(64))
             }
         };
-        for idx in self.viewer.visible_indices(total) {
-            let path = self.collection.entries[idx].path.clone();
-            let filters = self.effective_filters(idx);
-            self.cache.get_or_request(idx, &path, &filters, max_size, ctx);
+        for di in self.viewer.visible_indices(total) {
+            let ci = self.ci(di);
+            let path = self.collection.entries[ci].path.clone();
+            let filters = self.effective_filters(di);
+            self.cache.get_or_request(ci, &path, &filters, max_size, ctx);
         }
     }
 
     fn render_single(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.collection.is_empty() {
+        if self.filtered_indices.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No images found.");
+                ui.label(if self.collection.is_empty() { "No images found." } else { "No results." });
             });
             return;
         }
 
-        let idx = self.viewer.focused_index();
+        let di = self.viewer.focused_index();
+        let idx = self.ci(di);
         let path = self.collection.entries[idx].path.clone();
         let rating = self.collection.entries[idx].data.rating;
-        let filters = self.effective_filters(idx);
+        let filters = self.effective_filters(di);
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -498,7 +566,7 @@ impl GalerieApp {
                 }
                 // Histogram overlay (bottom-right, anchored to viewport not image)
                 if self.app_state.show_histogram {
-                    if let Some(hist) = self.cache.get_histogram(idx) {
+                    if let Some(hist) = self.cache.get_histogram(idx) { // idx is already collection idx
                         render_histogram_overlay(ui, avail, hist);
                     }
                 }
@@ -545,14 +613,14 @@ impl GalerieApp {
     }
 
     fn render_tiling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.collection.is_empty() {
+        if self.filtered_indices.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("No images found.");
+                ui.label(if self.collection.is_empty() { "No images found." } else { "No results." });
             });
             return;
         }
 
-        let total = self.collection.len();
+        let total = self.display_len();
         let (page, cols, selected_in_page) = match &self.viewer {
             ViewerState::Tiling(s) => (s.page, s.cols, s.selected),
             ViewerState::Single(_) => unreachable!(),
@@ -560,16 +628,20 @@ impl GalerieApp {
         let tile_count = cols * cols;
         let start = page * tile_count;
         let end = (start + tile_count).min(total);
-        let focused_abs = (start + selected_in_page).min(total - 1);
+        let focused_di = (start + selected_in_page).min(total - 1);
+        let focused_ci = self.ci(focused_di);
 
         // Header
         ui.horizontal(|ui| {
             let total_pages = total.div_ceil(tile_count);
-            let fname = self.collection.entries[focused_abs]
+            let fname = self.collection.entries[focused_ci]
                 .path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+            let search_indicator = if !self.search_query.is_empty() {
+                format!(" (filtered: {total}/{} total)", self.collection.len())
+            } else { String::new() };
             ui.label(
                 egui::RichText::new(format!(
-                    "Page {}/{total_pages}  ·  {focused_abs}/{total}  ·  {fname}",
+                    "Page {}/{total_pages}  ·  {focused_di}/{total}  ·  {fname}{search_indicator}",
                     page + 1
                 ))
                 .size(12.0)
@@ -585,17 +657,18 @@ impl GalerieApp {
         let cell_sz = egui::vec2(cell_size, cell_size);
 
         // Collect tile data before the grid (avoids borrow conflicts).
-        let gal_info = self.collection.galerie_filters(); // Option<(Vec<Filter>, GalleryFilterPosition)>
+        let gal_info = self.collection.galerie_filters();
         let entries: Vec<_> = (start..end)
-            .map(|i| {
-                let e = &self.collection.entries[i];
+            .map(|di| {
+                let ci = self.ci(di);
+                let e = &self.collection.entries[ci];
                 let in_edit = self.edit_galleries.iter().any(|eg| eg.contains(&e.path));
                 let filters = compose_filters(&e.data.filters, gal_info.as_ref());
-                (i, e.path.clone(), e.data.rating, filters, in_edit)
+                (ci, e.path.clone(), e.data.rating, filters, in_edit)
             })
             .collect();
 
-        let mut clicked_idx: Option<usize> = None;
+        let mut clicked_di: Option<usize> = None;
         let mut selected_rect: Option<egui::Rect> = None;
 
         egui::ScrollArea::vertical()
@@ -606,15 +679,15 @@ impl GalerieApp {
                     .num_columns(cols)
                     .spacing([spacing, spacing])
                     .show(ui, |ui| {
-                        for (tile_in_page, (idx, path, rating, filters, in_edit)) in entries.into_iter().enumerate() {
+                        for (tile_in_page, (ci, path, rating, filters, in_edit)) in entries.into_iter().enumerate() {
                             let is_selected = tile_in_page == selected_in_page;
-                            let load_state = self.cache.get_or_request(idx, &path, &filters, tile_max_size, ctx);
+                            let load_state = self.cache.get_or_request(ci, &path, &filters, tile_max_size, ctx);
                             let response = self.render_tile(ui, load_state, rating, cell_sz, is_selected, in_edit);
                             if is_selected {
                                 selected_rect = Some(response.rect);
                             }
                             if response.clicked() {
-                                clicked_idx = Some(idx);
+                                clicked_di = Some(start + tile_in_page);
                             }
                             if (tile_in_page + 1) % cols == 0 {
                                 ui.end_row();
@@ -630,8 +703,8 @@ impl GalerieApp {
                 }
             });
 
-        if let Some(idx) = clicked_idx {
-            self.viewer.switch_to_single(idx);
+        if let Some(di) = clicked_di {
+            self.viewer.switch_to_single(di);
         }
     }
 
@@ -710,11 +783,12 @@ impl GalerieApp {
     // ── Annotations panel ───────────────────────────────────────────────────────
 
     fn render_annotations_panel(&mut self, ctx: &egui::Context) {
-        if !self.app_state.show_annotations || self.collection.is_empty() {
+        if !self.app_state.show_annotations || self.filtered_indices.is_empty() {
             return;
         }
 
-        let idx = self.viewer.focused_index();
+        let di = self.viewer.focused_index();
+        let idx = self.ci(di);
         let filename = self.collection.entries[idx]
             .path
             .file_name()
@@ -768,25 +842,35 @@ impl GalerieApp {
                 ui.separator();
                 ui.add_space(4.0);
 
-                ui.horizontal(|ui| {
-                    let input = ui.add(
-                        egui::TextEdit::singleline(&mut self.annotation_input)
-                            .hint_text("Add note…")
-                            .desired_width(ui.available_width() - 50.0),
+                let has_galerie = self.collection.entries[idx].galerie_source.is_some();
+                if has_galerie {
+                    ui.horizontal(|ui| {
+                        let input = ui.add(
+                            egui::TextEdit::singleline(&mut self.annotation_input)
+                                .hint_text("Add note…")
+                                .desired_width(ui.available_width() - 50.0),
+                        );
+                        if self.annotation_focus_pending {
+                            input.request_focus();
+                            self.annotation_focus_pending = false;
+                        }
+                        let submit = ui.button("Add");
+                        let pressed_enter = input.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (submit.clicked() || pressed_enter) && !self.annotation_input.trim().is_empty() {
+                            add_text = Some(self.annotation_input.trim().to_owned());
+                            self.annotation_input.clear();
+                            input.request_focus();
+                        }
+                    });
+                } else {
+                    self.annotation_focus_pending = false;
+                    ui.label(
+                        egui::RichText::new("Open a .galerie file to save annotations.")
+                            .italics()
+                            .color(egui::Color32::GRAY),
                     );
-                    if self.annotation_focus_pending {
-                        input.request_focus();
-                        self.annotation_focus_pending = false;
-                    }
-                    let submit = ui.button("Add");
-                    let pressed_enter = input.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (submit.clicked() || pressed_enter) && !self.annotation_input.trim().is_empty() {
-                        add_text = Some(self.annotation_input.trim().to_owned());
-                        self.annotation_input.clear();
-                        input.request_focus();
-                    }
-                });
+                }
             });
 
         if !open {
@@ -807,6 +891,8 @@ impl GalerieApp {
             }
             if let Err(e) = self.collection.update_data(idx, new_data) {
                 self.overlay.push_toast(format!("Annotation error: {e}"));
+            } else if !self.search_query.is_empty() {
+                self.update_filter();
             }
         }
     }
@@ -832,9 +918,11 @@ impl GalerieApp {
         let mut gal_post_add: Option<Filter> = None;
 
         // ── Per-photo filter state ──────────────────────────────────────────────
+        // idx is display index; ci is collection index used for data and cache access.
         let idx = if is_single { Some(self.viewer.focused_index()) } else { None };
-        let photo_histogram: Option<ImageHistogram> = idx.and_then(|i| self.cache.get_histogram(i).cloned());
-        let mut new_filters = idx
+        let ci = idx.map(|di| self.ci(di));
+        let photo_histogram: Option<ImageHistogram> = ci.and_then(|i| self.cache.get_histogram(i).cloned());
+        let mut new_filters = ci
             .map(|i| self.collection.entries[i].data.filters.clone())
             .unwrap_or_default();
         let mut photo_changed = false;
@@ -1030,13 +1118,13 @@ impl GalerieApp {
             photo_changed = true;
         }
         if photo_changed {
-            if let Some(i) = idx {
-                let mut new_data = self.collection.entries[i].data.clone();
+            if let Some(collection_idx) = ci {
+                let mut new_data = self.collection.entries[collection_idx].data.clone();
                 new_data.filters = new_filters;
-                if let Err(e) = self.collection.update_data(i, new_data) {
+                if let Err(e) = self.collection.update_data(collection_idx, new_data) {
                     self.overlay.push_toast(format!("Filter error: {e}"));
                 } else {
-                    self.cache.invalidate(i);
+                    self.cache.invalidate(collection_idx);
                 }
             }
         }
@@ -1088,6 +1176,20 @@ impl eframe::App for GalerieApp {
                         .size(12.0)
                         .color(egui::Color32::GRAY),
                 );
+                ui.separator();
+                let search_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("search annotations…")
+                        .desired_width(160.0)
+                        .font(egui::FontId::proportional(12.0)),
+                );
+                if search_resp.changed() {
+                    self.update_filter();
+                }
+                if !self.search_query.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
+                    self.search_query.clear();
+                    self.update_filter();
+                }
                 if !self.edit_galleries.is_empty() {
                     ui.separator();
                     let label = if self.edit_galleries.len() == 1 {
@@ -1127,8 +1229,8 @@ impl eframe::App for GalerieApp {
 
                 // Right-aligned controls
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.collection.is_empty() {
-                        let ann_count = self.collection.entries[self.viewer.focused_index()]
+                    if !self.filtered_indices.is_empty() {
+                        let ann_count = self.collection.entries[self.ci(self.viewer.focused_index())]
                             .data.annotations.len();
                         let ann_label = if ann_count > 0 {
                             format!("✎ {ann_count}")

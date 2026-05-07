@@ -347,12 +347,16 @@ pub struct ActionContext<'a> {
     pub script_tx: &'a crossbeam_channel::Sender<ScriptRequest>,
     pub script_result_tx: crossbeam_channel::Sender<ScriptResult>,
     pub ctx: egui::Context,
+    /// Number of photos currently visible (after search filtering).
+    pub display_len: usize,
+    /// Maps a display index (viewer position) to a collection index.
+    pub display_to_collection: &'a [usize],
 }
 
 pub fn execute_action(action: &Action, cx: &mut ActionContext) {
     match action {
         Action::Navigate { direction, count } => {
-            cx.viewer.navigate(*direction, *count, cx.collection.len());
+            cx.viewer.navigate(*direction, *count, cx.display_len);
             cx.app_state.slideshow_last_at = std::time::Instant::now();
             if matches!(cx.viewer, ViewerState::Tiling(_)) {
                 cx.app_state.needs_scroll_to_selection = true;
@@ -362,7 +366,7 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
             if matches!(cx.viewer, ViewerState::Single(_)) {
                 cx.viewer.zoom_single(*delta as f32);
             } else {
-                cx.viewer.zoom_tiling(*delta, cx.collection.len());
+                cx.viewer.zoom_tiling(*delta, cx.display_len);
             }
         }
         Action::SwitchMode { mode } => match mode {
@@ -420,7 +424,7 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
             cx.app_state.show_annotations = !cx.app_state.show_annotations;
         }
         Action::NavigateTilingRow { direction } => {
-            let total = cx.collection.len();
+            let total = cx.display_len;
             if total == 0 {
                 return;
             }
@@ -443,10 +447,15 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
 }
 
 fn handle_cycle_rating(values: &[u8], cx: &mut ActionContext) {
-    if cx.collection.is_empty() || values.is_empty() {
+    if cx.display_len == 0 || values.is_empty() {
         return;
     }
-    let idx = cx.viewer.focused_index();
+    let display_idx = cx.viewer.focused_index();
+    let idx = cx.display_to_collection[display_idx];
+    if cx.collection.entries[idx].galerie_source.is_none() {
+        cx.overlay.push_toast("Open a .galerie file to save ratings".to_owned());
+        return;
+    }
     let current_rating = cx.collection.entries[idx].data.rating;
     let next_rating = next_cycle_value(current_rating, values);
     let mut new_data = cx.collection.entries[idx].data.clone();
@@ -457,11 +466,12 @@ fn handle_cycle_rating(values: &[u8], cx: &mut ActionContext) {
 }
 
 fn handle_apply_filter_to_all(incoming: Filter, cx: &mut ActionContext) {
-    if cx.collection.is_empty() {
+    if cx.display_len == 0 {
         return;
     }
-    let n = cx.collection.len();
-    for idx in 0..n {
+    let n = cx.display_len;
+    for di in 0..n {
+        let idx = cx.display_to_collection[di];
         let mut new_data = cx.collection.entries[idx].data.clone();
         filters::apply_to_stack(&mut new_data.filters, incoming.clone());
         if let Err(e) = cx.collection.update_data(idx, new_data) {
@@ -474,10 +484,11 @@ fn handle_apply_filter_to_all(incoming: Filter, cx: &mut ActionContext) {
 }
 
 fn handle_apply_filter(incoming: Filter, cx: &mut ActionContext) {
-    if cx.collection.is_empty() {
+    if cx.display_len == 0 {
         return;
     }
-    let idx = cx.viewer.focused_index();
+    let display_idx = cx.viewer.focused_index();
+    let idx = cx.display_to_collection[display_idx];
     let mut new_data = cx.collection.entries[idx].data.clone();
     filters::apply_to_stack(&mut new_data.filters, incoming);
 
@@ -556,12 +567,13 @@ fn handle_run_script(path: &PathBuf, arg_templates: &[String], pass_filters_stdi
         return;
     }
 
-    if cx.collection.is_empty() {
+    if cx.display_len == 0 {
         cx.overlay.push_toast("No photo selected".to_owned());
         return;
     }
 
-    let idx = cx.viewer.focused_index();
+    let display_idx = cx.viewer.focused_index();
+    let idx = cx.display_to_collection[display_idx];
     let photo_path = cx.collection.entries[idx].path.clone();
 
     // Compose effective filters: gallery pre → per-photo → gallery post.
