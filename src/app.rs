@@ -131,6 +131,13 @@ impl GalerieApp {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        // Drain deferred viewport commands (must be outside the input closure to avoid Wayland deadlocks).
+        if let Some(fs) = self.app_state.fullscreen_pending.take() {
+            log::debug!("handle_input: sending Fullscreen({fs})");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fs));
+            log::debug!("handle_input: Fullscreen({fs}) sent");
+        }
+
         // Keep last_tiling_cols in sync so switching back from single restores the grid size.
         if let ViewerState::Tiling(s) = &self.viewer {
             self.last_tiling_cols = s.cols;
@@ -201,8 +208,19 @@ impl GalerieApp {
 
                     // ── Escape exits fullscreen before doing anything else ────────
                     if *key == egui::Key::Escape && self.app_state.is_fullscreen {
+                        log::debug!("Escape: queuing Fullscreen(false) for next frame");
                         self.app_state.is_fullscreen = false;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        self.app_state.fullscreen_pending = Some(false);
+                        continue;
+                    }
+
+                    // ── Escape clears similarity/search filter when already in tiling ─
+                    if *key == egui::Key::Escape
+                        && matches!(self.viewer, crate::viewer::ViewerState::Tiling(_))
+                        && self.filtered_indices.len() < self.collection.len()
+                    {
+                        self.search_query.clear();
+                        self.update_filter();
                         continue;
                     }
 
@@ -229,6 +247,8 @@ impl GalerieApp {
                             if self.app_state.show_annotations {
                                 self.annotation_focus_pending = true;
                             }
+                        } else if let crate::actions::Action::FindSimilar { namespace, count } = &action {
+                            self.handle_find_similar(namespace, *count);
                         } else {
                             let tile_count = self.last_tiling_cols * self.last_tiling_cols;
                             let mut cx = ActionContext {
@@ -298,9 +318,20 @@ impl GalerieApp {
                 .filter(|&i| {
                     let anns = &self.collection.entries[i].data.annotations;
                     tokens.iter().all(|token| {
+                        if let Some(id_str) = token.strip_prefix("cluster:") {
+                            if let Ok(cid) = id_str.parse::<u32>() {
+                                return anns.iter().any(|a| matches!(a,
+                                    Annotation::ClusterAssignment { cluster_id, .. }
+                                    if *cluster_id == cid
+                                ));
+                            }
+                        }
                         anns.iter().any(|ann| {
-                            let Annotation::Note { text } = ann;
-                            text.to_lowercase().contains(token)
+                            if let Annotation::Note { text } = ann {
+                                text.to_lowercase().contains(token)
+                            } else {
+                                false
+                            }
                         })
                     })
                 })
@@ -325,6 +356,55 @@ impl GalerieApp {
                 s.current_index = new_di;
             }
         }
+    }
+
+    fn handle_find_similar(&mut self, namespace: &str, n: usize) {
+        log::debug!("[find_similar] start: display_len={}, collection={}", self.filtered_indices.len(), self.collection.entries.len());
+        let display_len = self.filtered_indices.len();
+        if display_len == 0 { return; }
+
+        let di = self.viewer.focused_index().min(display_len - 1);
+        let idx = self.filtered_indices[di];
+        log::debug!("[find_similar] query photo: di={di}, collection_idx={idx}");
+
+        let query_vec = self.collection.entries[idx].data.annotations.iter()
+            .find_map(|a| a.decode_embedding(namespace));
+        let Some(query) = query_vec else {
+            log::debug!("[find_similar] no embedding for query photo");
+            self.overlay.push_toast(format!("No embedding (namespace: {namespace:?}) for this photo"));
+            return;
+        };
+        log::debug!("[find_similar] query vector decoded: {} dims", query.len());
+
+        let query_norm = l2_normalise(&query);
+
+        log::debug!("[find_similar] scoring {} collection entries…", self.collection.entries.len());
+        let mut scored: Vec<(usize, f32)> = self.collection.entries.iter().enumerate()
+            .filter_map(|(i, e)| {
+                e.data.annotations.iter()
+                    .find_map(|a| a.decode_embedding(namespace))
+                    .map(|v| (i, dot(&query_norm, &l2_normalise(&v))))
+            })
+            .collect();
+        log::debug!("[find_similar] scored {} photos", scored.len());
+
+        if scored.is_empty() {
+            self.overlay.push_toast(format!("No photos with embeddings (namespace: {namespace:?})"));
+            return;
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(n);
+
+        self.filtered_indices = scored.into_iter().map(|(i, _)| i).collect();
+        let new_len = self.filtered_indices.len();
+        log::debug!("[find_similar] filtered_indices updated: {new_len} entries");
+
+        self.viewer = crate::viewer::ViewerState::new_tiling(
+            self.last_tiling_cols * self.last_tiling_cols
+        );
+        log::debug!("[find_similar] viewer reset to tiling, done");
+        self.overlay.push_toast(format!("Showing {new_len} most similar (namespace: {namespace:?})"));
     }
 
     fn bg_color(&self) -> egui::Color32 {
@@ -890,7 +970,7 @@ impl GalerieApp {
                 } else {
                     use crate::gallery::Annotation;
                     for (i, ann) in current.iter().enumerate() {
-                        let Annotation::Note { text } = ann;
+                        let Annotation::Note { text } = ann else { continue };
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("✎").color(egui::Color32::GRAY));
                             ui.label(text);
@@ -1432,7 +1512,7 @@ impl eframe::App for GalerieApp {
                 ui.separator();
                 let search_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("search annotations…")
+                        .hint_text("search annotations… (cluster:N)")
                         .desired_width(160.0)
                         .font(egui::FontId::proportional(12.0)),
                 );
@@ -1829,4 +1909,14 @@ fn export_to_temp(path: &std::path::Path, filters: &[Filter]) -> Result<std::pat
     let tmp = std::env::temp_dir().join(format!("{stem}_galerie.png"));
     img.save(&tmp).map_err(|e| e.to_string())?;
     Ok(tmp)
+}
+
+fn l2_normalise(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm < 1e-12 { return v.to_vec(); }
+    v.iter().map(|x| x / norm).collect()
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

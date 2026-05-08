@@ -23,6 +23,9 @@ Supported image formats: JPEG, PNG, WebP, TIFF.
 
 ```
 galerie-montsouris [OPTIONS] <path1> [path2] ...
+galerie-montsouris apply-filter <spec.json> <input> <output>
+galerie-montsouris embed   --namespace NAME --command "cmd %p" <file.galerie>
+galerie-montsouris cluster --namespace NAME --clusters K       <file.galerie>
 
 Options:
   --save-as <file.galerie>          Save the loaded collection as a gallery file, then launch.
@@ -171,6 +174,81 @@ In tiling mode the focused tile is highlighted in blue. `←`/`→` move the sel
 | Copy source path | Copies the original file path to the clipboard |
 | Export (apply filters) & copy path | Saves a filtered PNG to a temp file and copies its path |
 
+## Annotations
+
+Open the annotations panel with the **`✎`** button in the top-right corner (or bind `ToggleAnnotations` to a key). The panel shows all notes attached to the focused photo and lets you add or remove them. Notes are saved into the `.galerie` file; a gallery file must be loaded to save annotations.
+
+### Searching
+
+The search box in the top bar filters the collection. Tokens are matched case-insensitively against note text; all tokens must match (AND logic):
+
+```
+paris sunset          → photos whose notes contain both "paris" and "sunset"
+cluster:3             → photos assigned to cluster 3 by the `cluster` command
+cluster:3 paris       → cluster 3 AND note contains "paris"
+```
+
+### Embedding annotations
+
+Embeddings are numerical vector representations of photos (e.g. from a CLIP or similar model) stored inside the `.galerie` file as annotations. They enable clustering and visual similarity search.
+
+Use the `embed` subcommand to compute and store embeddings:
+
+```bash
+galerie-montsouris embed \
+  --namespace clip \
+  --command "my-embedder %p" \
+  gallery.galerie
+```
+
+`%p` is replaced with the absolute path to each photo. The command must print the embedding to **stdout** as either:
+- raw little-endian IEEE 754 `f32` bytes, or
+- a single base64-encoded line of those bytes.
+
+Photos that already have an embedding for the given namespace are skipped. Use `--force` to re-embed them.
+
+Example Python/NumPy script:
+
+```python
+#!/usr/bin/env python3
+import sys, numpy as np
+from my_model import embed   # returns a float32 ndarray
+vec = embed(sys.argv[1])
+sys.stdout.buffer.write(vec.astype("<f4").tobytes())
+```
+
+### Clustering
+
+Once embeddings are stored, assign cluster labels with the `cluster` subcommand:
+
+```bash
+galerie-montsouris cluster \
+  --namespace clip \
+  --clusters 8 \
+  gallery.galerie
+```
+
+This runs k-means on the embeddings (cosine distance, k-means++ seeding) and writes a `ClusterAssignment` annotation to each photo. Then filter by cluster in the viewer:
+
+```
+cluster:0   → photos in cluster 0
+cluster:5   → photos in cluster 5
+```
+
+### Similarity search
+
+With embeddings stored, bind `FindSimilar` to a key to filter the tiling view to the N most similar photos to the focused one:
+
+```toml
+[[keybindings]]
+key       = "F"
+modifiers = ["ctrl"]
+action    = "FindSimilar"
+args      = { namespace = "clip", count = 20 }
+```
+
+Pressing the key replaces the current view with the 20 nearest neighbours (by cosine similarity), most similar first.
+
 ## Filters
 
 Filters are applied non-destructively and stored in the `.galerie.json` sidecar file. Open the filter sidebar with `E` (single-photo mode) to add and adjust filters interactively.
@@ -251,6 +329,8 @@ args      = { direction = "next" }
 | `ApplyFilter` | `{ filter = "CapSize", max_px = 1024 }` — shrink longest dim to ≤ max_px |
 | `ApplyFilter` | `{ filter = "Border", thickness = 10, color = [255,255,255,255] }` — RGBA border |
 | `ApplyFilterToAll` | same `filter` args as `ApplyFilter` — applies to every photo in the collection |
+| `ToggleAnnotations` | `{}` — open / close the annotations panel |
+| `FindSimilar` | `{ namespace = "clip", count = 20 }` — filter to N most similar photos by embedding cosine similarity |
 | `RunScript` | `{ path = "~/bin/script.sh", args = ["%p"], pass_filters_stdin = false }` |
 
 ### Key names

@@ -48,6 +48,9 @@ pub enum Action {
     ApplyFilterToAll { filter: Filter },
     /// Toggle the annotations panel.
     ToggleAnnotations,
+    /// Filter the collection to the N photos most similar to the focused photo by embedding
+    /// cosine similarity, then switch to tiling mode.
+    FindSimilar { namespace: String, count: usize },
 }
 
 impl Action {
@@ -272,6 +275,19 @@ impl Action {
                 Action::ApplyFilterToAll { filter }
             }
             "ToggleAnnotations" => Action::ToggleAnnotations,
+            "FindSimilar" => {
+                let namespace = table
+                    .and_then(|t| t.get("namespace"))
+                    .and_then(|v| v.as_str())
+                    .context("FindSimilar requires args.namespace")?
+                    .to_owned();
+                let count = table
+                    .and_then(|t| t.get("count"))
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(20)
+                    .max(1) as usize;
+                Action::FindSimilar { namespace, count }
+            }
             "NavigateTilingRow" => {
                 let direction = table
                     .and_then(|t| t.get("direction"))
@@ -314,6 +330,8 @@ pub struct AppState {
     pub show_histogram: bool,
     pub needs_scroll_to_selection: bool,
     pub is_fullscreen: bool,
+    /// Deferred fullscreen command — processed at the top of the next frame, outside the input loop.
+    pub fullscreen_pending: Option<bool>,
     /// Signals render_single to set zoom so 1 image pixel = 1 screen pixel.
     pub zoom_to_one_pending: bool,
     pub show_annotations: bool,
@@ -331,6 +349,7 @@ impl Default for AppState {
             show_histogram: false,
             needs_scroll_to_selection: false,
             is_fullscreen: false,
+            fullscreen_pending: None,
             zoom_to_one_pending: false,
             show_annotations: false,
         }
@@ -414,8 +433,12 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
             cx.app_state.zoom_to_one_pending = true;
         }
         Action::ToggleFullscreen => {
-            cx.app_state.is_fullscreen = !cx.app_state.is_fullscreen;
-            cx.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(cx.app_state.is_fullscreen));
+            log::debug!("ToggleFullscreen: is_fullscreen={}", cx.app_state.is_fullscreen);
+            if !cx.app_state.is_fullscreen {
+                log::debug!("ToggleFullscreen: queuing Fullscreen(true) for next frame");
+                cx.app_state.is_fullscreen = true;
+                cx.app_state.fullscreen_pending = Some(true);
+            }
         }
         Action::ApplyFilterToAll { filter } => {
             handle_apply_filter_to_all(filter.clone(), cx);
@@ -423,6 +446,8 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
         Action::ToggleAnnotations => {
             cx.app_state.show_annotations = !cx.app_state.show_annotations;
         }
+        // Handled upstream in GalerieApp::handle_input (needs access to filtered_indices).
+        Action::FindSimilar { .. } => {}
         Action::NavigateTilingRow { direction } => {
             let total = cx.display_len;
             if total == 0 {

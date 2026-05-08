@@ -1,7 +1,9 @@
 mod actions;
 mod app;
+mod cluster;
 mod config;
 mod curve_editor;
+mod embed;
 mod filters;
 mod gallery;
 mod image_cache;
@@ -43,6 +45,10 @@ struct Cli {
     /// then exit (no GUI). Fails if the output file already exists.
     #[arg(long, value_name = "FILE")]
     init_gallery: Option<PathBuf>,
+
+    /// Enable debug logging to stderr.
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +69,44 @@ enum Cmd {
         input: PathBuf,
         /// Output image file (format inferred from extension; .png recommended).
         output: PathBuf,
+    },
+
+    /// Compute embeddings for all photos in a .galerie file and store them as annotations.
+    ///
+    /// The command template receives the photo path via `%p` and must print to stdout
+    /// either raw little-endian f32 bytes or a base64-encoded version of those bytes.
+    ///
+    /// Example (NumPy):
+    ///   galerie-montsouris embed --namespace clip --command "my-embedder %p" gallery.galerie
+    Embed {
+        /// Embedding namespace (e.g. "clip", "custom-v1").
+        #[arg(long)]
+        namespace: String,
+        /// Command template to run per photo. `%p` is replaced with the photo path.
+        #[arg(long, value_name = "CMD")]
+        command: String,
+        /// Re-embed photos that already have an embedding for this namespace.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// The .galerie file to process.
+        galerie: PathBuf,
+    },
+
+    /// Cluster photos by embedding similarity and store cluster assignments as annotations.
+    ///
+    /// Requires that embeddings have already been computed with `embed` for the same namespace.
+    ///
+    /// Example:
+    ///   galerie-montsouris cluster --namespace clip --clusters 8 gallery.galerie
+    Cluster {
+        /// Embedding namespace to read (must match the one used with `embed`).
+        #[arg(long)]
+        namespace: String,
+        /// Number of clusters (k in k-means).
+        #[arg(long = "clusters", value_name = "K")]
+        k: usize,
+        /// The .galerie file to process.
+        galerie: PathBuf,
     },
 }
 
@@ -172,12 +216,31 @@ fn run_init_gallery(dest: &Path, collection: &gallery::PhotoCollection) -> Resul
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
-
     let cli = Cli::parse();
+
+    env_logger::Builder::new()
+        .filter_level(if cli.debug { log::LevelFilter::Debug } else { log::LevelFilter::Warn })
+        .init();
 
     if let Some(Cmd::ApplyFilter { spec, input, output }) = &cli.command {
         return run_apply_filter(spec, input, output);
+    }
+
+    if let Some(Cmd::Embed { namespace, command, force, galerie }) = &cli.command {
+        return embed::run_embed(embed::EmbedConfig {
+            namespace: namespace.clone(),
+            command_template: command.clone(),
+            force: *force,
+            galerie_path: galerie.clone(),
+        });
+    }
+
+    if let Some(Cmd::Cluster { namespace, k, galerie }) = &cli.command {
+        return cluster::run_cluster(cluster::ClusterConfig {
+            namespace: namespace.clone(),
+            k: *k,
+            galerie_path: galerie.clone(),
+        });
     }
 
     if cli.paths.is_empty() && cli.init_gallery.is_none() {

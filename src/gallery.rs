@@ -22,6 +22,41 @@ pub struct FilterPreset {
 #[serde(tag = "kind")]
 pub enum Annotation {
     Note { text: String },
+    Embedding {
+        namespace: String,
+        /// Base64-encoded little-endian IEEE 754 f32 bytes.
+        data: String,
+    },
+    ClusterAssignment {
+        namespace: String,
+        cluster_id: u32,
+    },
+    /// Catches unknown annotation kinds so future variants don't break loading.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Annotation {
+    pub fn embedding(namespace: &str, vec: &[f32]) -> Self {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Annotation::Embedding { namespace: namespace.to_owned(), data }
+    }
+
+    pub fn decode_embedding(&self, ns: &str) -> Option<Vec<f32>> {
+        use base64::Engine as _;
+        if let Annotation::Embedding { namespace, data } = self {
+            if namespace != ns { return None; }
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+            if bytes.len() % 4 != 0 { return None; }
+            Some(bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        } else {
+            None
+        }
+    }
 }
 
 
@@ -649,7 +684,7 @@ mod tests {
         let col2 = PhotoCollection::from_args(&[InputArg::GalleryFile(gal_path)]).unwrap();
         assert_eq!(col2.entries[0].data.rating, Some(4));
         assert_eq!(col2.entries[0].data.annotations.len(), 1);
-        let Annotation::Note { text } = &col2.entries[0].data.annotations[0];
+        let Annotation::Note { text } = &col2.entries[0].data.annotations[0] else { panic!("expected Note") };
         assert_eq!(text, "lovely");
     }
 
