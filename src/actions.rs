@@ -51,6 +51,9 @@ pub enum Action {
     /// Filter the collection to the N photos most similar to the focused photo by embedding
     /// cosine similarity, then switch to tiling mode.
     FindSimilar { namespace: String, count: usize },
+    /// Like FindSimilar but greedily ensures no two results are within `threshold` L2 distance
+    /// of each other (on normalised vectors), producing a diverse set.
+    FindSimilarDiverse { namespace: String, count: usize, threshold: f32 },
 }
 
 impl Action {
@@ -288,6 +291,23 @@ impl Action {
                     .max(1) as usize;
                 Action::FindSimilar { namespace, count }
             }
+            "FindSimilarDiverse" => {
+                let namespace = table
+                    .and_then(|t| t.get("namespace"))
+                    .and_then(|v| v.as_str())
+                    .context("FindSimilarDiverse requires args.namespace")?
+                    .to_owned();
+                let count = table
+                    .and_then(|t| t.get("count"))
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(20)
+                    .max(1) as usize;
+                let threshold = table
+                    .and_then(|t| t.get("threshold"))
+                    .and_then(|v| v.as_float())
+                    .unwrap_or(0.3) as f32;
+                Action::FindSimilarDiverse { namespace, count, threshold }
+            }
             "NavigateTilingRow" => {
                 let direction = table
                     .and_then(|t| t.get("direction"))
@@ -448,6 +468,7 @@ pub fn execute_action(action: &Action, cx: &mut ActionContext) {
         }
         // Handled upstream in GalerieApp::handle_input (needs access to filtered_indices).
         Action::FindSimilar { .. } => {}
+        Action::FindSimilarDiverse { .. } => {}
         Action::NavigateTilingRow { direction } => {
             let total = cx.display_len;
             if total == 0 {

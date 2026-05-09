@@ -49,6 +49,20 @@ pub struct GalerieApp {
     presets: Vec<(FilterPreset, PresetSource)>,
     /// Pending name text in the "Save from stack" preset form.
     preset_save_name: String,
+    /// Active find-similar state (Some while viewing a similarity result set).
+    similar_state: Option<SimilarState>,
+}
+
+/// State retained while viewing a find-similar / find-similar-diverse result set.
+struct SimilarState {
+    namespace: String,
+    count: usize,
+    /// `Some(threshold)` for diverse mode, `None` for plain cosine similarity.
+    threshold: Option<f32>,
+    /// Collection index of the photo that was used as the query.
+    query_ci: usize,
+    /// Whether the parameter panel (sliders) is currently shown.
+    panel_open: bool,
 }
 
 /// Identifies which galerie file owns a preset, so edits can be saved back.
@@ -127,6 +141,7 @@ impl GalerieApp {
             gallery_post_accordion_open: HashSet::new(),
             presets,
             preset_save_name: String::new(),
+            similar_state: None,
         }
     }
 
@@ -220,6 +235,7 @@ impl GalerieApp {
                         && self.filtered_indices.len() < self.collection.len()
                     {
                         self.search_query.clear();
+                        self.similar_state = None;
                         self.update_filter();
                         continue;
                     }
@@ -249,6 +265,8 @@ impl GalerieApp {
                             }
                         } else if let crate::actions::Action::FindSimilar { namespace, count } = &action {
                             self.handle_find_similar(namespace, *count);
+                        } else if let crate::actions::Action::FindSimilarDiverse { namespace, count, threshold } = &action {
+                            self.handle_find_similar_diverse(namespace, *count, *threshold);
                         } else {
                             let tile_count = self.last_tiling_cols * self.last_tiling_cols;
                             let mut cx = ActionContext {
@@ -358,27 +376,46 @@ impl GalerieApp {
         }
     }
 
-    fn handle_find_similar(&mut self, namespace: &str, n: usize) {
-        log::debug!("[find_similar] start: display_len={}, collection={}", self.filtered_indices.len(), self.collection.entries.len());
+    fn handle_find_similar(&mut self, namespace: &str, count: usize) {
         let display_len = self.filtered_indices.len();
         if display_len == 0 { return; }
+        let query_ci = self.filtered_indices[self.viewer.focused_index().min(display_len - 1)];
+        self.find_similar_from_ci(namespace, count, query_ci);
+        if self.filtered_indices.len() > 0 {
+            self.similar_state = Some(SimilarState {
+                namespace: namespace.to_owned(),
+                count,
+                threshold: None,
+                query_ci,
+                panel_open: false,
+            });
+        }
+    }
 
-        let di = self.viewer.focused_index().min(display_len - 1);
-        let idx = self.filtered_indices[di];
-        log::debug!("[find_similar] query photo: di={di}, collection_idx={idx}");
+    fn handle_find_similar_diverse(&mut self, namespace: &str, count: usize, threshold: f32) {
+        let display_len = self.filtered_indices.len();
+        if display_len == 0 { return; }
+        let query_ci = self.filtered_indices[self.viewer.focused_index().min(display_len - 1)];
+        self.find_similar_diverse_from_ci(namespace, count, threshold, query_ci);
+        if self.filtered_indices.len() > 0 {
+            self.similar_state = Some(SimilarState {
+                namespace: namespace.to_owned(),
+                count,
+                threshold: Some(threshold),
+                query_ci,
+                panel_open: false,
+            });
+        }
+    }
 
-        let query_vec = self.collection.entries[idx].data.annotations.iter()
+    fn find_similar_from_ci(&mut self, namespace: &str, count: usize, query_ci: usize) {
+        let query_vec = self.collection.entries[query_ci].data.annotations.iter()
             .find_map(|a| a.decode_embedding(namespace));
         let Some(query) = query_vec else {
-            log::debug!("[find_similar] no embedding for query photo");
             self.overlay.push_toast(format!("No embedding (namespace: {namespace:?}) for this photo"));
             return;
         };
-        log::debug!("[find_similar] query vector decoded: {} dims", query.len());
-
         let query_norm = l2_normalise(&query);
-
-        log::debug!("[find_similar] scoring {} collection entries…", self.collection.entries.len());
         let mut scored: Vec<(usize, f32)> = self.collection.entries.iter().enumerate()
             .filter_map(|(i, e)| {
                 e.data.annotations.iter()
@@ -386,25 +423,60 @@ impl GalerieApp {
                     .map(|v| (i, dot(&query_norm, &l2_normalise(&v))))
             })
             .collect();
-        log::debug!("[find_similar] scored {} photos", scored.len());
-
         if scored.is_empty() {
             self.overlay.push_toast(format!("No photos with embeddings (namespace: {namespace:?})"));
             return;
         }
-
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(n);
-
+        scored.truncate(count);
+        let new_len = scored.len();
         self.filtered_indices = scored.into_iter().map(|(i, _)| i).collect();
-        let new_len = self.filtered_indices.len();
-        log::debug!("[find_similar] filtered_indices updated: {new_len} entries");
-
-        self.viewer = crate::viewer::ViewerState::new_tiling(
-            self.last_tiling_cols * self.last_tiling_cols
-        );
-        log::debug!("[find_similar] viewer reset to tiling, done");
+        self.viewer = crate::viewer::ViewerState::new_tiling(self.last_tiling_cols * self.last_tiling_cols);
         self.overlay.push_toast(format!("Showing {new_len} most similar (namespace: {namespace:?})"));
+    }
+
+    fn find_similar_diverse_from_ci(&mut self, namespace: &str, count: usize, threshold: f32, query_ci: usize) {
+        let query_vec = self.collection.entries[query_ci].data.annotations.iter()
+            .find_map(|a| a.decode_embedding(namespace));
+        let Some(query) = query_vec else {
+            self.overlay.push_toast(format!("No embedding (namespace: {namespace:?}) for this photo"));
+            return;
+        };
+        let query_norm = l2_normalise(&query);
+        let mut candidates: Vec<(usize, Vec<f32>, f32)> = self.collection.entries.iter().enumerate()
+            .filter_map(|(i, e)| {
+                e.data.annotations.iter()
+                    .find_map(|a| a.decode_embedding(namespace))
+                    .map(|v| {
+                        let norm = l2_normalise(&v);
+                        let sim = dot(&query_norm, &norm);
+                        (i, norm, sim)
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            self.overlay.push_toast(format!("No photos with embeddings (namespace: {namespace:?})"));
+            return;
+        }
+        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let min_sq = threshold * threshold;
+        let mut selected: Vec<usize> = Vec::with_capacity(count);
+        let mut selected_vecs: Vec<Vec<f32>> = Vec::with_capacity(count);
+        for (ci, norm, _) in &candidates {
+            if selected.len() >= count { break; }
+            if !selected_vecs.iter().any(|sv| sq_dist(sv, norm) < min_sq) {
+                selected.push(*ci);
+                selected_vecs.push(norm.clone());
+            }
+        }
+        if selected.is_empty() {
+            self.overlay.push_toast("No diverse photos found (threshold may be too high)".to_owned());
+            return;
+        }
+        let new_len = selected.len();
+        self.filtered_indices = selected;
+        self.viewer = crate::viewer::ViewerState::new_tiling(self.last_tiling_cols * self.last_tiling_cols);
+        self.overlay.push_toast(format!("Showing {new_len} diverse similar (namespace: {namespace:?})"));
     }
 
     fn bg_color(&self) -> egui::Color32 {
@@ -468,6 +540,68 @@ impl GalerieApp {
     }
 
     /// Render the floating gallery-membership selector (when open).
+    fn render_similar_panel(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.similar_state else { return; };
+        if !state.panel_open { return; }
+
+        // Snapshot params as locals — avoids borrow conflicts with self inside the closure.
+        let mut count = state.count;
+        let mut threshold = state.threshold;
+        let namespace = state.namespace.clone();
+        let query_ci = state.query_ci;
+        let is_diverse = threshold.is_some();
+
+        let mut changed = false;
+
+        egui::Window::new("Similar params")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 30.0))
+            .show(ctx, |ui| {
+                egui::Grid::new("similar_panel_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Count");
+                        let mut c = count as i32;
+                        if ui.add(egui::Slider::new(&mut c, 1..=200).integer()).changed() {
+                            count = c as usize;
+                            changed = true;
+                        }
+                        ui.end_row();
+
+                        if let Some(ref mut t) = threshold {
+                            ui.label("Threshold");
+                            if ui.add(
+                                egui::Slider::new(t, 0.0f32..=1.5)
+                                    .fixed_decimals(2)
+                                    .step_by(0.01),
+                            ).changed() {
+                                changed = true;
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        // Write changed params back and re-run if needed.
+        if let Some(state) = &mut self.similar_state {
+            state.count = count;
+            if let (Some(ref mut st), Some(new_t)) = (&mut state.threshold, threshold) {
+                *st = new_t;
+            }
+        }
+
+        if changed {
+            if is_diverse {
+                let th = threshold.unwrap_or(0.3);
+                self.find_similar_diverse_from_ci(&namespace, count, th, query_ci);
+            } else {
+                self.find_similar_from_ci(&namespace, count, query_ci);
+            }
+        }
+    }
+
     fn render_gallery_selector(&mut self, ctx: &egui::Context) {
         if !self.gallery_selector_open || self.filtered_indices.is_empty() {
             return;
@@ -1559,6 +1693,23 @@ impl eframe::App for GalerieApp {
                     ui.spinner();
                     ui.label(egui::RichText::new("Running script…").size(12.0).color(egui::Color32::YELLOW));
                 }
+                if matches!(&self.viewer, ViewerState::Tiling(_)) {
+                    if let Some(ref mut ss) = self.similar_state {
+                        ui.separator();
+                        let label = if ss.threshold.is_some() { "≈∙" } else { "≈" };
+                        let btn = egui::Button::new(
+                            egui::RichText::new(label).size(13.0).color(egui::Color32::from_rgb(100, 200, 255))
+                        ).selected(ss.panel_open);
+                        let hover = if ss.threshold.is_some() {
+                            "Similar (diverse) — click to adjust params"
+                        } else {
+                            "Similar — click to adjust params"
+                        };
+                        if ui.add(btn).on_hover_text(hover).clicked() {
+                            ss.panel_open = !ss.panel_open;
+                        }
+                    }
+                }
 
                 // Right-aligned controls
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1612,6 +1763,9 @@ impl eframe::App for GalerieApp {
 
         // 9. Gallery selector overlay (rendered as a floating window on top)
         self.render_gallery_selector(ctx);
+
+        // 9b. Find-similar parameter panel
+        self.render_similar_panel(ctx);
 
         // 10. Toast overlay
         self.overlay.render_toast(ctx);
@@ -1919,4 +2073,8 @@ fn l2_normalise(v: &[f32]) -> Vec<f32> {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn sq_dist(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
