@@ -26,12 +26,12 @@ galerie-montsouris [OPTIONS] <path1> [path2] ...
 galerie-montsouris apply-filter <spec.json> <input> <output>
 galerie-montsouris embed   --namespace NAME --command "cmd %p" <file.galerie>
 galerie-montsouris cluster --namespace NAME --clusters K       <file.galerie>
+galerie-montsouris export  <out-dir> <path1> [path2] ...
 
 Options:
   --save-as <file.galerie>          Save the loaded collection as a gallery file, then launch.
   --edit-gallery <file.galerie>     Open a gallery for interactive editing (repeatable).
   --init-gallery <file.galerie>     Create a new gallery file with all discovered photos, then exit.
-  --export-to <dir>                 Export all photos as filtered PNGs, then exit (no GUI).
 ```
 
 Each positional `path` is either a **directory** to scan or a **`.galerie` gallery file** to load. Both can be mixed freely in a single invocation.

@@ -35,12 +35,6 @@ struct Cli {
     #[arg(long = "edit-gallery", value_name = "FILE", action = clap::ArgAction::Append)]
     edit_galleries: Vec<PathBuf>,
 
-    /// Export all photos as PNG with filters baked in, then exit (no GUI).
-    /// Output files are named `{index:04}_{original-stem}.png`.
-    /// EXIF metadata is not written to the exported files.
-    #[arg(long, value_name = "DIR")]
-    export_to: Option<PathBuf>,
-
     /// Create a new .galerie file populated with every photo found in the given paths,
     /// then exit (no GUI). Fails if the output file already exists.
     #[arg(long, value_name = "FILE")]
@@ -82,9 +76,18 @@ enum Cmd {
         /// Embedding namespace (e.g. "clip", "custom-v1").
         #[arg(long)]
         namespace: String,
-        /// Command template to run per photo. `%p` is replaced with the photo path.
+        /// Command template to run per photo. `%p` is replaced with the photo path(s).
+        /// In single mode (default), `%p` is substituted anywhere in the string.
+        /// In batch mode (--batch-size > 1), `%p` must be a standalone word and is expanded
+        /// to all paths in the batch as separate arguments; the command must print one
+        /// base64-encoded embedding per line, in the same order as the input paths.
         #[arg(long, value_name = "CMD")]
         command: String,
+        /// Number of images to pass to the command per invocation (default: 1).
+        /// Use with a command that can embed multiple images in one call (e.g. to amortise
+        /// GPU/model loading costs). Output must be one base64 line per image.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        batch_size: usize,
         /// Re-embed photos that already have an embedding for this namespace.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -107,6 +110,22 @@ enum Cmd {
         k: usize,
         /// The .galerie file to process.
         galerie: PathBuf,
+    },
+
+    /// Export all photos as PNG with filters baked in, then exit (no GUI).
+    ///
+    /// Output files are named `{index:04}_{original-stem}.png`.
+    /// EXIF metadata is not written to the exported files.
+    ///
+    /// Example:
+    ///   galerie-montsouris export ./out gallery.galerie
+    ///   galerie-montsouris export ./out ~/Pictures/2024/
+    Export {
+        /// Output directory (created if it does not exist).
+        out_dir: PathBuf,
+        /// Directories to scan or .galerie files to load.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -226,10 +245,11 @@ fn main() -> Result<()> {
         return run_apply_filter(spec, input, output);
     }
 
-    if let Some(Cmd::Embed { namespace, command, force, galerie }) = &cli.command {
+    if let Some(Cmd::Embed { namespace, command, batch_size, force, galerie }) = &cli.command {
         return embed::run_embed(embed::EmbedConfig {
             namespace: namespace.clone(),
             command_template: command.clone(),
+            batch_size: *batch_size,
             force: *force,
             galerie_path: galerie.clone(),
         });
@@ -241,6 +261,12 @@ fn main() -> Result<()> {
             k: *k,
             galerie_path: galerie.clone(),
         });
+    }
+
+    if let Some(Cmd::Export { out_dir, paths }) = &cli.command {
+        let args = classify_args(paths);
+        let collection = gallery::PhotoCollection::from_args(&args)?;
+        return run_export(&collection, out_dir);
     }
 
     if cli.paths.is_empty() && cli.init_gallery.is_none() {
@@ -257,10 +283,6 @@ fn main() -> Result<()> {
     let collection = gallery::PhotoCollection::from_args(&args)?;
 
     log::info!("Loaded {} photos", collection.len());
-
-    if let Some(out_dir) = &cli.export_to {
-        return run_export(&collection, out_dir);
-    }
 
     if let Some(dest) = &cli.init_gallery {
         return run_init_gallery(dest, &collection);
