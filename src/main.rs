@@ -124,6 +124,21 @@ enum Cmd {
         galerie: PathBuf,
     },
 
+    /// Add photos from directories to an existing .galerie file, then exit (no GUI).
+    ///
+    /// Photos already in the gallery (matched by absolute path or content hash) are skipped.
+    /// All other gallery metadata (ratings, filters, annotations, presets) is preserved.
+    ///
+    /// Example:
+    ///   galerie-montsouris add-to-gallery gallery.galerie ~/Pictures/2024/ ~/Pictures/2025/
+    AddToGallery {
+        /// The .galerie file to append to (must already exist).
+        galerie: PathBuf,
+        /// Directories to scan for new photos.
+        #[arg(value_name = "DIR")]
+        dirs: Vec<PathBuf>,
+    },
+
     /// Export all photos as PNG with filters baked in, then exit (no GUI).
     ///
     /// Output files are named `{index:04}_{original-stem}.png`.
@@ -226,6 +241,54 @@ fn run_export(collection: &gallery::PhotoCollection, out_dir: &Path, concurrency
     Ok(())
 }
 
+fn run_add_to_gallery(galerie_path: &Path, dirs: &[PathBuf]) -> Result<()> {
+    if !galerie_path.exists() {
+        anyhow::bail!("gallery file does not exist: {} (use --init-gallery to create one)", galerie_path.display());
+    }
+
+    let mut gf = gallery::load_gallery_file(galerie_path)?;
+
+    // Build dedup sets from existing entries.
+    let existing_paths: std::collections::HashSet<PathBuf> = gf.photos
+        .iter()
+        .filter_map(|e| e.path.canonicalize().ok())
+        .collect();
+    let existing_hashes: std::collections::HashSet<String> = gf.photos
+        .iter()
+        .filter(|e| !e.hash.is_empty())
+        .map(|e| e.hash.clone())
+        .collect();
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+
+    for dir in dirs {
+        let args = vec![gallery::InputArg::Directory(dir.clone())];
+        let col = gallery::PhotoCollection::from_args(&args)
+            .with_context(|| format!("scanning directory {}", dir.display()))?;
+
+        for entry in &col.entries {
+            let canon = entry.path.canonicalize().unwrap_or_else(|_| entry.path.clone());
+            if existing_paths.contains(&canon) || existing_hashes.contains(&entry.hash) {
+                skipped += 1;
+                continue;
+            }
+            gf.photos.push(GalleryEntry {
+                path: entry.path.clone(),
+                hash: entry.hash.clone(),
+                filters: vec![],
+                rating: None,
+                annotations: vec![],
+            });
+            added += 1;
+        }
+    }
+
+    gallery::save_gallery_file(galerie_path, &gf)?;
+    eprintln!("Added {added} photos to {} ({skipped} already present)", galerie_path.display());
+    Ok(())
+}
+
 fn run_init_gallery(dest: &Path, collection: &gallery::PhotoCollection) -> Result<()> {
     if dest.exists() {
         anyhow::bail!("output file already exists: {}", dest.display());
@@ -297,6 +360,10 @@ fn main() -> Result<()> {
             k: *k,
             galerie_path: galerie.clone(),
         });
+    }
+
+    if let Some(Cmd::AddToGallery { galerie, dirs }) = &cli.command {
+        return run_add_to_gallery(galerie, dirs);
     }
 
     if let Some(Cmd::Export { out_dir, paths, concurrency }) = &cli.command {
