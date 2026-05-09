@@ -91,6 +91,12 @@ enum Cmd {
         /// Re-embed photos that already have an embedding for this namespace.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Optional JSON filter spec file (single Filter object or array of Filters).
+        /// Each image is pre-processed through this filter stack before being passed to
+        /// the embedding command. Useful for e.g. `{"type":"CapSize","max_px":512}` to
+        /// embed scaled-down thumbnails instead of full-resolution images.
+        #[arg(long, value_name = "FILE")]
+        filter_file: Option<PathBuf>,
         /// The .galerie file to process.
         galerie: PathBuf,
     },
@@ -245,12 +251,27 @@ fn main() -> Result<()> {
         return run_apply_filter(spec, input, output);
     }
 
-    if let Some(Cmd::Embed { namespace, command, batch_size, force, galerie }) = &cli.command {
+    if let Some(Cmd::Embed { namespace, command, batch_size, force, filter_file, galerie }) = &cli.command {
+        let filters = match filter_file {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading filter file {path:?}"))?;
+                if let Ok(arr) = serde_json::from_str::<Vec<filters::Filter>>(&text) {
+                    arr
+                } else {
+                    let f = serde_json::from_str::<filters::Filter>(&text)
+                        .with_context(|| format!("parsing {path:?}: expected a Filter object or array"))?;
+                    vec![f]
+                }
+            }
+            None => vec![],
+        };
         return embed::run_embed(embed::EmbedConfig {
             namespace: namespace.clone(),
             command_template: command.clone(),
             batch_size: *batch_size,
             force: *force,
+            filters,
             galerie_path: galerie.clone(),
         });
     }

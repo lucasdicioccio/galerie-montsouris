@@ -3,6 +3,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::filters::Filter;
 use crate::gallery::{self, Annotation};
 
 pub struct EmbedConfig {
@@ -19,6 +20,10 @@ pub struct EmbedConfig {
     pub batch_size: usize,
     /// Re-embed photos that already have an embedding for this namespace.
     pub force: bool,
+    /// Filter stack applied to each image before embedding. Empty = pass original path.
+    /// When non-empty, each image is pre-processed to a temp PNG and that path is passed
+    /// to the command instead of the original.
+    pub filters: Vec<Filter>,
     pub galerie_path: PathBuf,
 }
 
@@ -26,6 +31,7 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
     let mut gf = gallery::load_gallery_file(&cfg.galerie_path)?;
     let total = gf.photos.len();
     let batch_size = cfg.batch_size.max(1);
+    let use_filters = !cfg.filters.is_empty();
 
     // Print "skip" for photos that already have embeddings and collect pending indices.
     let mut pending: Vec<usize> = Vec::new();
@@ -40,17 +46,37 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
         }
     }
 
+    // Temp dir for pre-processed images; created only when filters are in use.
+    let _tmp_dir = if use_filters {
+        Some(tempfile::tempdir().context("creating temp directory for pre-processed images")?)
+    } else {
+        None
+    };
+
     for chunk in pending.chunks(batch_size) {
-        let paths: Vec<&PathBuf> = chunk.iter().map(|&i| &gf.photos[i].path).collect();
+        let original_paths: Vec<&PathBuf> = chunk.iter().map(|&i| &gf.photos[i].path).collect();
 
         if batch_size == 1 {
-            let label = paths[0].file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let label = original_paths[0].file_name().and_then(|n| n.to_str()).unwrap_or("?");
             eprint!("[{}/{total}] {label} … ", chunk[0] + 1);
         } else {
             let first = chunk[0] + 1;
             let last = chunk[chunk.len() - 1] + 1;
             eprint!("[{first}-{last}/{total}] batch of {} … ", chunk.len());
         }
+
+        // Pre-process to temp PNGs when a filter stack is provided.
+        let processed: Vec<PathBuf>;
+        let paths: Vec<&PathBuf> = if use_filters {
+            let tmp = _tmp_dir.as_ref().unwrap();
+            processed = match preprocess_batch(&original_paths, &cfg.filters, tmp.path()) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("error pre-processing: {e}"); continue; }
+            };
+            processed.iter().collect()
+        } else {
+            original_paths.clone()
+        };
 
         let results = match run_batch_command(&cfg.command_template, &paths) {
             Ok(v) => v,
@@ -83,6 +109,23 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
         .with_context(|| format!("saving {:?}", cfg.galerie_path))?;
 
     Ok(())
+}
+
+/// Pre-process a batch of images through the filter stack, writing each to a temp PNG.
+/// Returns the paths of the temp files in the same order as `paths`.
+fn preprocess_batch(
+    paths: &[&PathBuf],
+    filters: &[Filter],
+    tmp_dir: &std::path::Path,
+) -> Result<Vec<PathBuf>> {
+    paths.iter().enumerate().map(|(i, src)| {
+        let rgba = crate::image_cache::load_and_process(src, filters)
+            .map_err(|e| anyhow::anyhow!("processing {}: {e}", src.display()))?;
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
+        let out = tmp_dir.join(format!("{i}_{stem}.png"));
+        rgba.save(&out).with_context(|| format!("saving temp image {}", out.display()))?;
+        Ok(out)
+    }).collect()
 }
 
 /// Run the command for one or more images and return their float embeddings.

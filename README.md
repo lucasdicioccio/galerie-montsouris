@@ -24,7 +24,7 @@ Supported image formats: JPEG, PNG, WebP, TIFF.
 ```
 galerie-montsouris [OPTIONS] <path1> [path2] ...
 galerie-montsouris apply-filter <spec.json> <input> <output>
-galerie-montsouris embed   --namespace NAME --command "cmd %p" <file.galerie>
+galerie-montsouris embed   --namespace NAME --command "cmd %p" [--filter-file spec.json] <file.galerie>
 galerie-montsouris cluster --namespace NAME --clusters K       <file.galerie>
 galerie-montsouris export  <out-dir> <path1> [path2] ...
 
@@ -206,6 +206,23 @@ galerie-montsouris embed \
 - a single base64-encoded line of those bytes.
 
 Photos that already have an embedding for the given namespace are skipped. Use `--force` to re-embed them.
+
+#### Pre-processing images before embedding
+
+Pass `--filter-file <file.json>` to apply a filter stack to each image before the embedding command sees it. The file contains a single Filter object or an array, in the same JSON format used by the `apply-filter` command. This is especially useful for scaling images down to the size the model expects:
+
+```bash
+# Scale every photo to at most 512px on its longest side before embedding
+echo '{"type":"CapSize","max_px":512}' > cap512.json
+
+galerie-montsouris embed \
+  --namespace clip \
+  --command "my-embedder %p" \
+  --filter-file cap512.json \
+  gallery.galerie
+```
+
+The original files are not modified — each photo is decoded, filtered, and written to a temporary PNG that is passed to the command in place of the original path. EXIF orientation is applied first (as in the viewer), followed by the filter stack.
 
 Example Python/NumPy script:
 
