@@ -97,6 +97,12 @@ enum Cmd {
         /// embed scaled-down thumbnails instead of full-resolution images.
         #[arg(long, value_name = "FILE")]
         filter_file: Option<PathBuf>,
+        /// Number of preprocessing threads for image decode + filter (default: number of logical CPUs).
+        #[arg(long, value_name = "K")]
+        concurrency: Option<usize>,
+        /// Number of batches to preprocess ahead of the embedding command (default: 2).
+        #[arg(long, default_value_t = 2, value_name = "N")]
+        prefetch_batches: usize,
         /// The .galerie file to process.
         galerie: PathBuf,
     },
@@ -132,7 +138,14 @@ enum Cmd {
         /// Directories to scan or .galerie files to load.
         #[arg(value_name = "PATH")]
         paths: Vec<PathBuf>,
+        /// Number of photos to process in parallel (default: number of logical CPUs).
+        #[arg(long, value_name = "K")]
+        concurrency: Option<usize>,
     },
+}
+
+fn default_concurrency() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
 fn classify_args(paths: &[PathBuf]) -> Vec<InputArg> {
@@ -171,40 +184,40 @@ fn run_apply_filter(spec: &Path, input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_export(collection: &gallery::PhotoCollection, out_dir: &Path) -> Result<()> {
+fn run_export(collection: &gallery::PhotoCollection, out_dir: &Path, concurrency: usize) -> Result<()> {
+    use rayon::prelude::*;
+
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating output directory {out_dir:?}"))?;
 
     let total = collection.len();
-    let mut errors = 0usize;
-
-    // Compose gallery pre/post filters once; they are the same for every photo.
     let (gal_pre, gal_post) = collection.galerie_filters().unwrap_or_default();
 
-    for (i, entry) in collection.entries.iter().enumerate() {
-        let stem = entry.path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("image");
-        let out_name = format!("{:04}_{stem}.png", i + 1);
-        let out_path = out_dir.join(&out_name);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .context("building rayon pool")?;
 
-        eprint!("[{}/{}] {} … ", i + 1, total, entry.path.display());
+    let errors: usize = pool.install(|| {
+        collection.entries.par_iter().enumerate().map(|(i, entry)| {
+            let stem = entry.path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+            let out_path = out_dir.join(format!("{:04}_{stem}.png", i + 1));
 
-        let effective: Vec<filters::Filter> = gal_pre.iter()
-            .chain(entry.data.filters.iter())
-            .chain(gal_post.iter())
-            .cloned()
-            .collect();
+            let effective: Vec<filters::Filter> = gal_pre.iter()
+                .chain(entry.data.filters.iter())
+                .chain(gal_post.iter())
+                .cloned()
+                .collect();
 
-        match image_cache::load_and_process(&entry.path, &effective) {
-            Ok(rgba) => match rgba.save(&out_path) {
-                Ok(()) => eprintln!("ok"),
-                Err(e) => { eprintln!("ERROR saving: {e}"); errors += 1; }
-            },
-            Err(e) => { eprintln!("ERROR decoding: {e}"); errors += 1; }
-        }
-    }
+            match image_cache::load_and_process(&entry.path, &effective) {
+                Ok(rgba) => match rgba.save(&out_path) {
+                    Ok(()) => { eprintln!("[{}/{}] {} … ok", i + 1, total, entry.path.display()); 0 }
+                    Err(e) => { eprintln!("[{}/{}] {} … ERROR saving: {e}", i + 1, total, entry.path.display()); 1 }
+                },
+                Err(e) => { eprintln!("[{}/{}] {} … ERROR decoding: {e}", i + 1, total, entry.path.display()); 1 }
+            }
+        }).sum()
+    });
 
     if errors > 0 {
         anyhow::bail!("{errors}/{total} photos failed to export");
@@ -251,7 +264,7 @@ fn main() -> Result<()> {
         return run_apply_filter(spec, input, output);
     }
 
-    if let Some(Cmd::Embed { namespace, command, batch_size, force, filter_file, galerie }) = &cli.command {
+    if let Some(Cmd::Embed { namespace, command, batch_size, force, filter_file, concurrency, prefetch_batches, galerie }) = &cli.command {
         let filters = match filter_file {
             Some(path) => {
                 let text = std::fs::read_to_string(path)
@@ -273,6 +286,8 @@ fn main() -> Result<()> {
             force: *force,
             filters,
             galerie_path: galerie.clone(),
+            concurrency: concurrency.unwrap_or_else(default_concurrency),
+            prefetch_batches: *prefetch_batches,
         });
     }
 
@@ -284,10 +299,10 @@ fn main() -> Result<()> {
         });
     }
 
-    if let Some(Cmd::Export { out_dir, paths }) = &cli.command {
+    if let Some(Cmd::Export { out_dir, paths, concurrency }) = &cli.command {
         let args = classify_args(paths);
         let collection = gallery::PhotoCollection::from_args(&args)?;
-        return run_export(&collection, out_dir);
+        return run_export(&collection, out_dir, concurrency.unwrap_or_else(default_concurrency));
     }
 
     if cli.paths.is_empty() && cli.init_gallery.is_none() {

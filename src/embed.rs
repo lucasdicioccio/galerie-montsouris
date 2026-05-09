@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::filters::Filter;
 use crate::gallery::{self, Annotation};
@@ -21,43 +23,105 @@ pub struct EmbedConfig {
     /// Re-embed photos that already have an embedding for this namespace.
     pub force: bool,
     /// Filter stack applied to each image before embedding. Empty = pass original path.
-    /// When non-empty, each image is pre-processed to a temp PNG and that path is passed
-    /// to the command instead of the original.
     pub filters: Vec<Filter>,
     pub galerie_path: PathBuf,
+    /// Number of preprocessing threads (image decode + filter + temp PNG write).
+    pub concurrency: usize,
+    /// How many prepared batches to buffer ahead of the embedding command.
+    pub prefetch_batches: usize,
+}
+
+struct PreparedBatch {
+    indices: Vec<usize>,
+    paths: Vec<PathBuf>,
 }
 
 pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
-    let mut gf = gallery::load_gallery_file(&cfg.galerie_path)?;
-    let total = gf.photos.len();
-    let batch_size = cfg.batch_size.max(1);
-    let use_filters = !cfg.filters.is_empty();
+    let EmbedConfig {
+        namespace,
+        command_template,
+        batch_size,
+        force,
+        filters,
+        galerie_path,
+        concurrency,
+        prefetch_batches,
+    } = cfg;
 
-    // Print "skip" for photos that already have embeddings and collect pending indices.
+    let mut gf = gallery::load_gallery_file(&galerie_path)?;
+    let total = gf.photos.len();
+    let batch_size = batch_size.max(1);
+    let use_filters = !filters.is_empty();
+
     let mut pending: Vec<usize> = Vec::new();
     for (i, entry) in gf.photos.iter().enumerate() {
-        let has_embedding = entry.annotations.iter().any(|a| matches!(a,
-            Annotation::Embedding { namespace, .. } if namespace == &cfg.namespace));
-        if !cfg.force && has_embedding {
+        let has_embedding = entry.annotations.iter().any(|a| {
+            matches!(a, Annotation::Embedding { namespace: ns, .. } if ns == &namespace)
+        });
+        if !force && has_embedding {
             let label = entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            eprintln!("[{i_1}/{total}] {label} … skip", i_1 = i + 1);
+            eprintln!("[{}/{total}] {label} … skip", i + 1);
         } else {
             pending.push(i);
         }
     }
 
-    // Temp dir for pre-processed images; created only when filters are in use.
-    let _tmp_dir = if use_filters {
-        Some(tempfile::tempdir().context("creating temp directory for pre-processed images")?)
+    // Collect batch inputs (just PathBuf clones) before spawning the producer.
+    let batches: Vec<(Vec<usize>, Vec<PathBuf>)> = pending
+        .chunks(batch_size)
+        .map(|chunk| {
+            let indices = chunk.to_vec();
+            let paths = chunk.iter().map(|&i| gf.photos[i].path.clone()).collect();
+            (indices, paths)
+        })
+        .collect();
+
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .context("building preprocessing thread pool")?,
+    );
+
+    let tmp_dir: Option<Arc<tempfile::TempDir>> = if use_filters {
+        Some(Arc::new(
+            tempfile::tempdir().context("creating temp directory for pre-processed images")?,
+        ))
     } else {
         None
     };
 
-    for chunk in pending.chunks(batch_size) {
-        let original_paths: Vec<&PathBuf> = chunk.iter().map(|&i| &gf.photos[i].path).collect();
+    let (tx, rx) = crossbeam_channel::bounded::<Result<PreparedBatch, String>>(prefetch_batches);
 
+    // Producer: preprocesses batches and sends them into the bounded channel.
+    let pool_prod = Arc::clone(&pool);
+    let tmp_prod = tmp_dir.clone();
+    std::thread::spawn(move || {
+        for (batch_num, (indices, orig_paths)) in batches.into_iter().enumerate() {
+            let result = if use_filters {
+                let tmp = tmp_prod.as_ref().unwrap();
+                preprocess_batch_parallel(&orig_paths, &filters, tmp.path(), &pool_prod, batch_num)
+                    .map(|paths| PreparedBatch { indices, paths })
+                    .map_err(|e| e.to_string())
+            } else {
+                Ok(PreparedBatch { indices, paths: orig_paths })
+            };
+            if tx.send(result).is_err() {
+                break; // consumer dropped (e.g. early exit)
+            }
+        }
+    });
+
+    // Consumer: receives prepared batches and runs the embedding command.
+    for result in rx {
+        let batch = match result {
+            Ok(b) => b,
+            Err(e) => { eprintln!("error pre-processing batch: {e}"); continue; }
+        };
+
+        let chunk = &batch.indices;
         if batch_size == 1 {
-            let label = original_paths[0].file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let label = gf.photos[chunk[0]].path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
             eprint!("[{}/{total}] {label} … ", chunk[0] + 1);
         } else {
             let first = chunk[0] + 1;
@@ -65,25 +129,10 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
             eprint!("[{first}-{last}/{total}] batch of {} … ", chunk.len());
         }
 
-        // Pre-process to temp PNGs when a filter stack is provided.
-        let processed: Vec<PathBuf>;
-        let paths: Vec<&PathBuf> = if use_filters {
-            let tmp = _tmp_dir.as_ref().unwrap();
-            processed = match preprocess_batch(&original_paths, &cfg.filters, tmp.path()) {
-                Ok(v) => v,
-                Err(e) => { eprintln!("error pre-processing: {e}"); continue; }
-            };
-            processed.iter().collect()
-        } else {
-            original_paths.clone()
-        };
-
-        let results = match run_batch_command(&cfg.command_template, &paths) {
+        let paths: Vec<&PathBuf> = batch.paths.iter().collect();
+        let results = match run_batch_command(&command_template, &paths) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("error: {e}");
-                continue;
-            }
+            Err(e) => { eprintln!("error: {e}"); continue; }
         };
 
         if results.len() != chunk.len() {
@@ -93,10 +142,14 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
 
         for (&idx, floats) in chunk.iter().zip(results.iter()) {
             let entry = &mut gf.photos[idx];
-            entry.annotations.retain(|a| !matches!(a,
-                Annotation::Embedding { namespace, .. } if namespace == &cfg.namespace));
-            entry.annotations.push(Annotation::embedding(&cfg.namespace, floats));
+            entry.annotations.retain(|a| {
+                !matches!(a, Annotation::Embedding { namespace: ns, .. } if ns == &namespace)
+            });
+            entry.annotations.push(Annotation::embedding(&namespace, floats));
         }
+
+        gallery::save_gallery_file(&galerie_path, &gf)
+            .with_context(|| format!("saving {galerie_path:?}"))?;
 
         if results.len() == 1 {
             eprintln!("ok ({}d)", results[0].len());
@@ -105,35 +158,35 @@ pub fn run_embed(cfg: EmbedConfig) -> Result<()> {
         }
     }
 
-    gallery::save_gallery_file(&cfg.galerie_path, &gf)
-        .with_context(|| format!("saving {:?}", cfg.galerie_path))?;
-
     Ok(())
 }
 
-/// Pre-process a batch of images through the filter stack, writing each to a temp PNG.
-/// Returns the paths of the temp files in the same order as `paths`.
-fn preprocess_batch(
-    paths: &[&PathBuf],
+/// Pre-process a batch of images through the filter stack in parallel, writing each to a temp PNG.
+fn preprocess_batch_parallel(
+    paths: &[PathBuf],
     filters: &[Filter],
     tmp_dir: &std::path::Path,
+    pool: &rayon::ThreadPool,
+    batch_num: usize,
 ) -> Result<Vec<PathBuf>> {
-    paths.iter().enumerate().map(|(i, src)| {
-        let rgba = crate::image_cache::load_and_process(src, filters)
-            .map_err(|e| anyhow::anyhow!("processing {}: {e}", src.display()))?;
-        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
-        let out = tmp_dir.join(format!("{i}_{stem}.png"));
-        rgba.save(&out).with_context(|| format!("saving temp image {}", out.display()))?;
-        Ok(out)
-    }).collect()
+    pool.install(|| {
+        paths
+            .par_iter()
+            .enumerate()
+            .map(|(i, src)| -> Result<PathBuf> {
+                let rgba = crate::image_cache::load_and_process(src, filters)
+                    .map_err(|e| anyhow::anyhow!("processing {}: {e}", src.display()))?;
+                let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("img");
+                let out = tmp_dir.join(format!("{batch_num}_{i}_{stem}.png"));
+                rgba.save(&out)
+                    .with_context(|| format!("saving temp image {}", out.display()))?;
+                Ok(out)
+            })
+            .collect::<Result<Vec<_>>>()
+    })
 }
 
 /// Run the command for one or more images and return their float embeddings.
-///
-/// Single image: `%p` is substituted anywhere in the template string; output may be raw
-/// little-endian f32 bytes or a single base64 line.
-/// Multiple images: `%p` as a standalone word expands to all paths as separate args;
-/// output must be one base64 line per image, in order.
 fn run_batch_command(template: &str, paths: &[&PathBuf]) -> Result<Vec<Vec<f32>>> {
     if paths.len() == 1 {
         let cmd_str = template.replace("%p", &paths[0].to_string_lossy());
@@ -159,8 +212,6 @@ fn run_batch_command(template: &str, paths: &[&PathBuf]) -> Result<Vec<Vec<f32>>
 }
 
 /// Build (program, args) for a batch invocation.
-/// A word equal to `%p` in the template is expanded to all paths as separate args.
-/// If no `%p` word is found, all paths are appended at the end.
 fn build_batch_args(template: &str, paths: &[&PathBuf]) -> (String, Vec<String>) {
     let mut parts = shell_words(template);
     if parts.is_empty() {
@@ -187,26 +238,26 @@ fn build_batch_args(template: &str, paths: &[&PathBuf]) -> (String, Vec<String>)
     (prog, args)
 }
 
-/// Parse one base64-encoded embedding per non-empty line.
 fn parse_batch_output(stdout: &[u8], expected: usize) -> Result<Vec<Vec<f32>>> {
     use base64::Engine as _;
-    let text = std::str::from_utf8(stdout)
-        .context("batch output is not valid UTF-8")?;
-    let lines: Vec<&str> = text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let text = std::str::from_utf8(stdout).context("batch output is not valid UTF-8")?;
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() != expected {
         anyhow::bail!(
             "expected {expected} output lines (one base64 embedding per image), got {}",
             lines.len()
         );
     }
-    lines.iter().enumerate().map(|(i, line)| {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(line)
-            .with_context(|| format!("failed to base64-decode line {}", i + 1))?;
-        bytes_to_floats(&bytes)
-    }).collect()
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(line)
+                .with_context(|| format!("failed to base64-decode line {}", i + 1))?;
+            bytes_to_floats(&bytes)
+        })
+        .collect()
 }
 
 fn run_command_capture_floats(cmd_str: &str) -> Result<Vec<f32>> {
@@ -248,12 +299,12 @@ fn bytes_to_floats(bytes: &[u8]) -> Result<Vec<f32>> {
     if bytes.len() % 4 != 0 {
         anyhow::bail!("output length {} is not a multiple of 4", bytes.len());
     }
-    Ok(bytes.chunks_exact(4)
+    Ok(bytes
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
 }
 
-/// Minimal whitespace-based word splitter (no quoting support).
 fn shell_words(s: &str) -> Vec<String> {
     s.split_whitespace().map(|w| w.to_owned()).collect()
 }
